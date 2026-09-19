@@ -1,0 +1,13 @@
+# Render.com blueprint - one-click deploy of the BitWeb signaling broker.
+# Dashboard -> New -> Blueprint -> point at this repo. Done.
+services:
+  - type: web
+    name: bitweb-signal
+    runtime: docker
+    dockerfilePath: ./broker/Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /peerjs/id
+    envVars:
+      - key: TRUST_PROXY
+        value: "1"

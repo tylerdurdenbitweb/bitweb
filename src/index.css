@@ -1,0 +1,428 @@
+/* Self-hosted fonts - zero third-party requests, zero IP leaks. */
+@font-face {
+  font-family: "VT323";
+  src: url("/fonts/vt323-400.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+/* The ASCII wordmark's coverage font: the bundled Plex Mono subset has NO
+   box-drawing/block glyphs, so every block and corner glyph fell back to
+   whatever the OS offered - aligned on most desktops, broken on many mobile
+   browsers. Noto Sans Mono (subset: ASCII + box drawing + block elements)
+   covers them all and leads the .ascii stack, so the art always renders in
+   ONE font with ONE advance width. Bundled via Vite (src/assets). */
+@font-face {
+  font-family: "Noto Sans Mono";
+  src: url("./assets/fonts/noto-sans-mono-400.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: url("/fonts/plex-mono-400.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: url("/fonts/plex-mono-500.woff2") format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: url("/fonts/plex-mono-600.woff2") format("woff2");
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: url("/fonts/plex-mono-700.woff2") format("woff2");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* =======================================================================
+   BITWEB/OS - 1984 terminal theme. Pure phosphor white on black glass.
+   ======================================================================= */
+
+@layer base {
+  :root {
+    --background: 0 0% 0%;
+    --foreground: 0 0% 92%;
+    --card: 0 0% 0%;
+    --card-foreground: 0 0% 92%;
+    --popover: 0 0% 0%;
+    --popover-foreground: 0 0% 92%;
+    --primary: 0 0% 92%;
+    --primary-foreground: 0 0% 0%;
+    --secondary: 0 0% 8%;
+    --secondary-foreground: 0 0% 92%;
+    --muted: 0 0% 8%;
+    --muted-foreground: 0 0% 55%;
+    --accent: 0 0% 14%;
+    --accent-foreground: 0 0% 98%;
+    --destructive: 0 0% 80%;
+    --destructive-foreground: 0 0% 0%;
+    --border: 0 0% 28%;
+    --input: 0 0% 28%;
+    --ring: 0 0% 80%;
+    --radius: 0px;
+  }
+
+  * {
+    border-color: hsl(var(--border));
+  }
+
+  html {
+    background: #000;
+    scrollbar-color: #444 #000;
+    /* Mobile pinch-zoom-out pan killer: some mobile browsers let the whole
+       page slide sideways during/after a pinch, revealing a blank strip on
+       the right. The root never scrolls horizontally, so forbid it
+       outright. `hidden` is the legacy fallback; `clip` wins where
+       supported because - unlike hidden - it creates no scroll container,
+       so the sticky topbar keeps sticking. */
+    overflow-x: hidden;
+    overscroll-behavior-x: none;
+  }
+  @supports (overflow: clip) {
+    html {
+      overflow-x: clip;
+    }
+  }
+
+  body {
+    @apply bg-black text-neutral-200;
+    font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 14px;
+    line-height: 1.5;
+    text-rendering: optimizeLegibility;
+  }
+
+  ::selection {
+    background: #e5e5e5;
+    color: #000;
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: #000;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #333;
+    border: 2px solid #000;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #666;
+  }
+
+  input,
+  textarea {
+    caret-color: #fff;
+  }
+}
+
+@layer components {
+  /* -- typography ---------------------------------------------------- */
+  .font-term {
+    font-family: "VT323", "IBM Plex Mono", ui-monospace, monospace;
+    letter-spacing: 0.02em;
+  }
+
+  .glow {
+    text-shadow:
+      0 0 4px rgba(255, 255, 255, 0.5),
+      0 0 18px rgba(255, 255, 255, 0.18);
+  }
+
+  .glow-soft {
+    text-shadow: 0 0 8px rgba(255, 255, 255, 0.25);
+  }
+
+  /* horizontal scroll strip with an invisible scrollbar (topbar nav) */
+  .no-scrollbar {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .dim {
+    color: #8a8a8a;
+  }
+  .dimmer {
+    color: #565656;
+  }
+
+  /* -- CRT overlay (scanlines + vignette + flicker) ----------------- */
+  .crt-overlay {
+    pointer-events: none;
+    position: fixed;
+    inset: 0;
+    z-index: 90;
+    background: repeating-linear-gradient(
+      to bottom,
+      rgba(0, 0, 0, 0) 0px,
+      rgba(0, 0, 0, 0) 2px,
+      rgba(0, 0, 0, 0.16) 3px,
+      rgba(0, 0, 0, 0.16) 4px
+    );
+    mix-blend-mode: multiply;
+  }
+  .crt-vignette {
+    pointer-events: none;
+    position: fixed;
+    inset: 0;
+    z-index: 91;
+    background: radial-gradient(
+      ellipse at center,
+      rgba(0, 0, 0, 0) 55%,
+      rgba(0, 0, 0, 0.35) 100%
+    );
+  }
+  .crt-flicker {
+    pointer-events: none;
+    position: fixed;
+    inset: 0;
+    z-index: 92;
+    background: rgba(255, 255, 255, 0.012);
+    animation: crt-flicker 0.12s infinite steps(2);
+  }
+
+  /* -- terminal widgets ---------------------------------------------- */
+  .term-panel {
+    @apply border border-neutral-700 bg-black/60;
+  }
+
+  .term-panel-title {
+    @apply inline-block bg-neutral-200 px-2 py-0 text-black font-semibold uppercase;
+    font-size: 12px;
+    letter-spacing: 0.14em;
+  }
+
+  .term-btn {
+    @apply inline-block border border-neutral-400 bg-black px-4 py-1.5 uppercase text-neutral-200 transition-none;
+    font-size: 13px;
+    letter-spacing: 0.12em;
+  }
+  .term-btn:hover {
+    @apply bg-neutral-200 text-black;
+  }
+  .term-btn:active {
+    @apply bg-neutral-400 text-black;
+  }
+  .term-btn[disabled] {
+    @apply border-neutral-700 text-neutral-600;
+    pointer-events: none;
+  }
+
+  .term-btn-primary {
+    @apply bg-neutral-200 text-black font-bold;
+  }
+  .term-btn-primary:hover {
+    @apply bg-white text-black;
+    box-shadow: 0 0 18px rgba(255, 255, 255, 0.35);
+  }
+
+  .term-input {
+    @apply w-full border border-neutral-700 bg-black px-3 py-2 text-neutral-200 outline-none placeholder:text-neutral-600;
+  }
+  .term-input:focus {
+    @apply border-neutral-300;
+    box-shadow: 0 0 12px rgba(255, 255, 255, 0.15);
+  }
+
+  .term-table th {
+    @apply border-b border-neutral-600 px-2 py-1 text-left font-semibold uppercase text-neutral-400;
+    font-size: 11px;
+    letter-spacing: 0.12em;
+  }
+  .term-table td {
+    @apply border-b border-neutral-800/70 px-2 py-1 align-top;
+  }
+  .term-table tr:hover td {
+    @apply bg-neutral-900/70;
+  }
+
+  .blink {
+    animation: crt-blink 1.06s steps(1) infinite;
+  }
+
+  /* one quick pulse when a new notification lands - no infinite flashing */
+  @keyframes badge-pop {
+    0% {
+      transform: scale(0.6);
+    }
+    55% {
+      transform: scale(1.3);
+    }
+    100% {
+      transform: scale(1);
+    }
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .badge-pop {
+      animation: badge-pop 0.5s ease-out;
+    }
+  }
+
+  .ascii {
+    /* Noto first: it carries the box-drawing/block glyphs the Plex subset
+       lacks - one font for the whole wordmark, on every browser */
+    font-family: "Noto Sans Mono", "IBM Plex Mono", ui-monospace, monospace;
+    white-space: pre;
+    line-height: 1.12;
+  }
+
+  .link-term {
+    @apply underline decoration-dotted underline-offset-4 hover:bg-neutral-200 hover:text-black hover:no-underline;
+  }
+}
+
+/* =======================================================================
+   ALL-DEVICE LAYER - phones, tablets, desktops, TVs.
+   ======================================================================= */
+
+/* Keyboard / TV d-pad navigation: every focused element gets a hard outline. */
+@layer base {
+  a:focus-visible,
+  button:focus-visible,
+  input:focus-visible,
+  select:focus-visible,
+  textarea:focus-visible,
+  [tabindex]:focus-visible {
+    outline: 2px dashed #e5e5e5;
+    outline-offset: 2px;
+  }
+}
+
+/* iPhone notch & co - keep the shell clear of rounded corners and home bars.
+   Unlayered on purpose: must beat the padding utilities on header/footer. */
+header,
+footer {
+  padding-left: max(env(safe-area-inset-left), 0.75rem);
+  padding-right: max(env(safe-area-inset-right), 0.75rem);
+}
+footer {
+  padding-bottom: max(env(safe-area-inset-bottom), 0.75rem);
+}
+
+/* Touch devices: real 44px targets, no sticky hover states, no iOS input zoom. */
+@media (pointer: coarse) {
+  .term-btn,
+  nav a,
+  .link-term {
+    min-height: 44px;
+    min-width: 44px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .link-term {
+    display: inline; /* links stay inline in prose, padding grows instead */
+    padding: 10px 4px;
+  }
+  input.term-input,
+  select.term-input,
+  textarea.term-input {
+    font-size: 16px; /* below 16px iOS force-zooms the viewport on focus */
+  }
+}
+
+/* Hover effects only where hover actually exists (kills tap-stuck states). */
+@media (hover: none) {
+  .term-btn:hover {
+    background-color: #000;
+    color: #e5e5e5;
+  }
+  .term-btn-primary:hover {
+    background-color: #e5e5e5;
+    color: #000;
+    box-shadow: none;
+  }
+  .term-table tr:hover td {
+    background: transparent;
+  }
+}
+
+/* Smart TV & large desktop walls: scale the whole UI from the root. */
+@media (min-width: 1920px) {
+  html {
+    font-size: 18px;
+  }
+}
+@media (min-width: 2560px) {
+  html {
+    font-size: 21px;
+  }
+}
+
+/* Respect reduced-motion: kill CRT flicker, blinking cursors, scanner sweep. */
+@media (prefers-reduced-motion: reduce) {
+  .crt-flicker,
+  .blink,
+  .scanline {
+    animation: none !important;
+  }
+}
+
+@keyframes crt-blink {
+  0%,
+  49% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0;
+  }
+}
+
+@keyframes crt-flicker {
+  0% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 0.9;
+  }
+  100% {
+    opacity: 0.55;
+  }
+}
+
+@keyframes boot-line {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* QR scanner viewfinder sweep - percentage of the scanner box, any size */
+.scanline {
+  animation: qr-scanline 1.8s ease-in-out infinite alternate;
+}
+
+@keyframes qr-scanline {
+  from {
+    top: 15%;
+  }
+  to {
+    top: calc(85% - 1px);
+  }
+}

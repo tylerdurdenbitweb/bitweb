@@ -1,0 +1,6 @@
+# Netlify/Cloudflare Pages-style header rules (ignored by GitHub Pages).
+# Clickjacking defence cannot be delivered via a <meta> CSP - it needs this.
+/*
+  X-Frame-Options: DENY
+  Referrer-Policy: no-referrer
+# test

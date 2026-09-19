@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0, viewport-fit=cover" />
+    <meta name="description" content="BitWeb [BTWB] - a peer-to-peer electronic cash system for the open web. Mine with your browser. No banks. No servers of trust." />
+    <link rel="icon" type="image/png" sizes="32x32" href="./favicon-32.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="./favicon-16.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="./apple-touch-icon.png" />
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <meta name="theme-color" content="#000000" />
+    <!-- iOS installability: Safari ignores the manifest, these are its hooks -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="BitWeb" />
+    <meta name="referrer" content="no-referrer" />
+    <!--
+      CSP for a zero-server static dapp: scripts/styles only from this origin
+      (React inline style attributes need style-src 'unsafe-inline'), network
+      limited to secure transports so the user-editable SIGNALING endpoint in
+      network.config.ts keeps working wherever it points. ws: is listed for
+      plain-WebSocket relay endpoints (RELAY_URLS / ?relay=) - on an https
+      page the browser's own mixed-content rules still force wss:. WebRTC
+      DataChannels and camera streams are not CSP-gated. (Clickjacking
+      protection needs an HTTP header - shipped as public/_headers for hosts
+      that support it.)
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self' data: blob: https: wss: ws:; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'none'"
+    />
+    <title>BITWEB [BTWB] MAINNET - The Serverless Browser Node</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

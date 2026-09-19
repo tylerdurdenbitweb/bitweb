@@ -29,9 +29,18 @@ export function Qr({
       margin: 2,
       width: size,
       color: { dark: "#000000", light: "#ffffff" },
-    }).catch(() => {
-      if (!dead) setErr(true);
-    });
+    })
+      .then(() => {
+        // qrcode's toCanvas stamps style.width/height = `${size}px` inline,
+        // which silently defeats every responsive CSS rule (verified on
+        // Firefox: the canvas overflowed its card on narrow screens).
+        // Take the sizing back: fluid width, intrinsic 1:1 ratio.
+        canvas.style.width = "100%";
+        canvas.style.height = "auto";
+      })
+      .catch(() => {
+        if (!dead) setErr(true);
+      });
     return () => {
       dead = true;
     };
@@ -41,12 +50,12 @@ export function Qr({
     <figure className={cn("inline-block", className)}>
       {/*
        * The responsive cap lives on the WRAPPER as a definite width
-       * (viewport-relative, never content-derived). Sizing the canvas
-       * itself with w-full + max-w-[min(...)] inside a shrink-to-fit
-       * inline-block is a cyclic percentage - Chrome happens to resolve
-       * it against the canvas' intrinsic size, Firefox legitimately
-       * collapses it and the QR vanishes. aspect-ratio is belt and
-       * braces for replaced-element sizing quirks.
+       * (viewport-relative, never content-derived) - a percentage cap on
+       * the canvas itself inside a shrink-to-fit parent is a cyclic
+       * percentage that Firefox resolves by collapsing it.
+       * The fluid width is re-applied inline AFTER every render (see the
+       * effect above): qrcode stamps a fixed pixel width on the element,
+       * and an inline style is the only thing that beats an inline style.
        */}
       <div
         className="box-border border-2 border-neutral-200 bg-white p-2 shadow-[0_0_24px_rgba(255,255,255,0.12)]"
@@ -64,8 +73,8 @@ export function Qr({
             ref={canvasRef}
             width={size}
             height={size}
-            className="block h-auto w-full"
-            style={{ aspectRatio: "1 / 1" }}
+            className="block"
+            style={{ width: "100%", height: "auto", aspectRatio: "1 / 1" }}
             role="img"
             aria-label={caption ?? "QR code"}
           />

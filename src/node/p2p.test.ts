@@ -394,3 +394,40 @@ describe("chain update gate - live two-tab sync", () => {
     b.stop();
   }, 120_000);
 });
+
+describe("mempool re-gossip - a tx made while alone still confirms", () => {
+  it("a late-joining peer receives the pending transfer without a resend", async () => {
+    // SOLO mines a block (funds w1) and signs a transfer with ZERO peers -
+    // the exact "sender is not mining / was offline" scenario. Before
+    // re-gossip, that tx could only ever confirm if the sender mined it
+    // themselves. A private channel keeps this pair deaf to the other
+    // describes' long-lived nodes.
+    const solo = await freshNode("solo", "bitweb-test-regossip");
+    await mineWith(solo, w1.address);
+    const unsigned = { from: w1.address, to: w2.address, amount: 5 * COIN, fee: 1_000, nonce: 0 };
+    const signature = signTransfer(w1.privHex, unsigned);
+    const { txid } = await solo.sendTx({ ...unsigned, pubkey: w1.pubHex, signature });
+    expect((await solo.mempool(10)).length).toBe(1);
+
+    // the peer joins AFTER the fact - nobody re-sends anything
+    const late = await freshNode("late", "bitweb-test-regossip");
+    await until(() => (solo.peers().length === 1 && late.peers().length === 1), 15_000);
+
+    // on-verification + post-sync mempool handoff delivers the pending tx
+    // (the first copy can race the late peer's sync and be retried - that
+    // retry path is exactly what this test guards)
+    await until(async () => (await late.mempool(10)).some((t) => t.txid === txid), 30_000);
+
+    // and the late peer can mine it in - both nodes converge, mempool drains
+    const b = await mineWith(late, w2.address);
+    expect(b.height).toBe(2);
+    await until(async () => (await solo.info()).tipHash === b.hash, 15_000);
+    expect((await solo.mempool(10)).length).toBe(0);
+    expect((await late.address(w2.address)).balance).toBe(
+      (await solo.address(w2.address)).balance,
+    );
+
+    solo.stop();
+    late.stop();
+  }, 120_000);
+});

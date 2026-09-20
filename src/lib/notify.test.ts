@@ -76,22 +76,27 @@ describe("notify()", () => {
     expect(persisted[0].message).toBe("You mined block #1,234. Reward: 500 BTWB");
   });
 
-  it("plays the mapped feedback sound for every type", async () => {
+  it("sound is tiered: money/risk events audible, mesh chatter silent", async () => {
     const { mod } = await boot();
-    const expected: Record<NotificationType, string> = {
+    const expected: Record<NotificationType, string | null> = {
       block_found: "block_found",
       transaction_received: "transaction_received",
       transfer_confirmed: "transaction_sent",
       pop_reward: "pop_reward",
-      system: "system",
       backup_reminder: "system",
-      peer_connected: "peer_connected",
-      mining_start: "mining_start",
-      mining_stop: "mining_stop",
       error: "error",
+      system: null, // silent tier - panel entry only
+      peer_connected: null,
+      mining_start: null,
+      mining_stop: null,
     };
     for (const t of TYPES) mod.notify(t, `msg-${t}`);
-    expect(mocks.feedback.mock.calls.map((c) => c[0])).toEqual(TYPES.map((t) => expected[t]));
+    expect(mocks.feedback.mock.calls.map((c) => c[0])).toEqual(
+      TYPES.map((t) => expected[t]).filter((c) => c !== null),
+    );
+    // every entry is still stored and unread - silence never hides events
+    expect(mod.getNotifications()).toHaveLength(TYPES.length);
+    expect(mod.getUnreadCount()).toBe(TYPES.length);
   });
 
   it("dedupes an identical type+message inside 60s, keeps distinct ones", async () => {

@@ -61,7 +61,17 @@ export default function Transfers() {
   const sendTx = useMutation({
     mutationFn: node.sendTx,
     onSuccess: ({ txid }) => {
-      setStatus({ ok: true, text: `broadcast accepted - txid ${txid}` });
+      // Honesty about confirmation: a transfer confirms when ANY miner
+      // includes it - the sender never has to mine. With zero peers the
+      // mesh cannot see it yet, so say exactly what happens next: it is
+      // re-gossiped automatically the moment a peer connects.
+      const peerless = node.peers().length === 0;
+      setStatus({
+        ok: true,
+        text: peerless
+          ? `accepted - txid ${txid}. No peers right now: it will be relayed to miners automatically as soon as a peer connects.`
+          : `broadcast accepted - txid ${txid}`,
+      });
       trackPendingTx(txid, unsignedAmountRef.current);
       soundEngine.feedback("transaction_sent"); // panel entry arrives on confirmation
       setAmountStr("");

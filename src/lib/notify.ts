@@ -2,8 +2,9 @@
  * Notification center - the terminal's memory of what happened while the
  * user was away. Every event worth telling the user about (mined blocks,
  * incoming transfers, confirmed sends, peers, mining state, errors) is
- * appended here, persisted to localStorage, and mirrored to the feedback
- * engine (sound + haptic + screen-reader line). Covers chain events (mined
+ * appended here, persisted to localStorage, and - for the AUDIBLE tier
+ * only - mirrored to the feedback engine (sound + haptic + screen-reader
+ * line). Covers chain events (mined
  * blocks, incoming transfers, confirmed sends, peers, mining state, errors)
  * and local risk cues (backup reminders, storage warnings).
  *
@@ -79,18 +80,20 @@ export const ICONS: Record<NotificationType, string> = {
   error: "[!]",
 };
 
-/** Which feedback sound/haptic each notification type plays on arrival. */
-const SOUND_MAP: Record<NotificationType, SoundEvent> = {
+/**
+ * Audibility tiers - sound is reserved for events that move your money or
+ * warn of losing it. Everything else lands in the panel SILENTLY: a busy
+ * mesh (peers joining, mining state churn, system notes) must never turn
+ * the terminal into a slot machine. null = visual only, no sound/haptic.
+ */
+const AUDIBLE: Partial<Record<NotificationType, SoundEvent>> = {
   block_found: "block_found",
   transaction_received: "transaction_received",
   transfer_confirmed: "transaction_sent",
   pop_reward: "pop_reward",
-  system: "system",
   backup_reminder: "system",
-  peer_connected: "peer_connected",
-  mining_start: "mining_start",
-  mining_stop: "mining_stop",
   error: "error",
+  // silent: system, peer_connected, mining_start, mining_stop
 };
 
 // -- store state -----------------------------------------------------------------
@@ -184,7 +187,8 @@ export function notify(type: NotificationType, message: string): AppNotification
   items = [...items, entry].slice(-MAX_ITEMS);
   persist();
   emit();
-  soundEngine.feedback(SOUND_MAP[type]);
+  const cue = AUDIBLE[type];
+  if (cue) soundEngine.feedback(cue); // silent tiers: panel entry only
   return entry;
 }
 

@@ -1502,6 +1502,15 @@ export async function getMempool(limit = 100): Promise<MempoolTxRow[]> {
   return rows.slice(0, Math.min(limit, 100));
 }
 
+/**
+ * Local mempool rows for re-gossip. Relay convenience, NOT consensus:
+ * receivers dedupe by txid and run full admission checks on every row,
+ * so sharing stale rows is always safe.
+ */
+export async function getLocalMempool(): Promise<MempoolTxRow[]> {
+  return db().mempool();
+}
+
 export async function getAddressOverview(address: string) {
   if (!checkAddress(address)) bad("invalid address (checksum failed)");
   const s = db();

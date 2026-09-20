@@ -50,6 +50,7 @@ import {
   applyWireBlock,
   chainHooks,
   getGenesisHash,
+  getLocalMempool,
   getTipSummary,
   getWireBlock,
   rollbackToHeight,
@@ -73,6 +74,8 @@ import type { Transport, TransportEvents } from "./transport";
 import { bumpStat } from "./stats";
 
 const REQUEST_TIMEOUT_MS = 8_000;
+/** Max pending transfers offered per re-gossip round (anti-flood cap). */
+const MEMPOOL_REGOSSIP_MAX = 100;
 
 /** Cap on remembered gossip ids - bounded memory for years of uptime. */
 const SEEN_TX_CAP = 8_192;
@@ -108,6 +111,10 @@ class LruSet {
       const oldest = this.map.keys().next().value;
       if (oldest !== undefined) this.map.delete(oldest);
     }
+  }
+  /** Un-mark a key (used when a dedupe was premature - see onGossipTx). */
+  delete(v: string): void {
+    this.map.delete(v);
   }
 }
 
@@ -166,6 +173,7 @@ export class P2pEngine {
   /** Attestations peers signed FOR us: payout address -> freshest attestation. */
   private attestations = new Map<string, PopAttestation>();
   private stopped = false;
+  private regossipTick = 0;
   private onPeerChange: (() => void) | null = null;
   /**
    * The greatest height we have EVIDENCE for (peer hellos, applied gossip,
@@ -732,6 +740,9 @@ export class P2pEngine {
     }
     const tip = await getTipSummary();
     if (p.hello.height > tip.height) this.requestSync(p.id);
+    // A fresh peer may be a miner who never saw our pending transfers -
+    // hand them over (this is what lets a NON-mining sender get confirmed).
+    void this.shareMempool(p.id);
     this.onPeerChange?.();
   }
 
@@ -753,6 +764,15 @@ export class P2pEngine {
       out.push(wb);
     }
     this.send(id, { type: "blocks", blocks: out });
+    // The peer just synced to our tip. NOW is when its state can actually
+    // validate our pending transfers (balance/nonce reads are current) -
+    // sharing before this moment hits "insufficient funds" on their side
+    // and the tx would die in transit. The 2s grace lets them apply the
+    // batch we just sent.
+    const tip = await getTipSummary();
+    if (out.length > 0 && out[out.length - 1].height >= tip.height) {
+      setTimeout(() => void this.shareMempool(id), 2_000);
+    }
   }
 
   private async onGossipBlock(p: PeerState, wb: WireBlock): Promise<void> {
@@ -830,7 +850,13 @@ export class P2pEngine {
     try {
       await admitTransfer(shape);
     } catch {
-      /* state-dependent rejection - honest races, not offences */
+      /* state-dependent rejection - honest races, not offences. CRITICAL:
+       * un-dedupe the txid so a LATER copy can be retried: the rejection
+       * may be purely transient (balance not synced yet, nonce arriving
+       * out of order, mempool momentarily full). Keeping the txid in
+       * seenTxs here would blackhole the transfer forever - every future
+       * re-gossip copy would die at the dedupe check above. */
+      this.seenTxs.delete(dedupId);
     }
   }
 
@@ -880,6 +906,47 @@ export class P2pEngine {
       }
       p.awaitingPong = true;
       this.send(p.id, { type: "ping", t: Date.now() });
+    }
+    // Every 2nd round (~1 min): re-gossip the local mempool. A transfer
+    // created while alone (or whose first gossip copies died in transit -
+    // e.g. arrived while the receiver was still syncing and failed its
+    // balance check) would otherwise sit here forever: the sender would
+    // have to mine their own block to ever see it confirm. Receivers
+    // dedupe by txid, so repeat sends are cheap no-ops.
+    this.regossipTick += 1;
+    if (this.regossipTick >= 2) {
+      this.regossipTick = 0;
+      void this.shareMempool(null);
+    }
+  }
+
+  /**
+   * Offer every locally pending transfer to a peer (or the whole mesh
+   * when peerId is null). Relay-only: receivers re-validate on admission.
+   */
+  private async shareMempool(peerId: string | null): Promise<void> {
+    if (this.stopped) return;
+    let rows;
+    try {
+      rows = await getLocalMempool();
+    } catch {
+      return; // storage mid-rotation - next round retries
+    }
+    for (const r of rows.slice(0, MEMPOOL_REGOSSIP_MAX)) {
+      const wire: WireTx = {
+        txid: r.txid,
+        type: "transfer",
+        fromAddress: r.fromAddress,
+        toAddress: r.toAddress,
+        amount: r.amount,
+        fee: r.fee,
+        nonce: r.nonce,
+        pubkey: r.pubkey,
+        signature: r.signature,
+        timestamp: r.timestamp,
+      };
+      if (peerId) this.send(peerId, { type: "tx", tx: wire });
+      else this.broadcast({ type: "tx", tx: wire });
     }
   }
 

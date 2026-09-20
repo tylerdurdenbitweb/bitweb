@@ -13,7 +13,6 @@ import { bootNode, type NodeHandle } from "@/node/client";
 import { getChainGateState, subscribeChainGate, type ChainGateState } from "@/node/chain-gate";
 import { notify } from "@/lib/notify";
 import { resetLocalData } from "@/lib/reset";
-import { shortAddr } from "@/lib/format";
 import { NodeContext } from "./node-context";
 
 const queryClient = new QueryClient();
@@ -54,21 +53,26 @@ export function NodeProvider({ children }: { children: ReactNode }) {
     let handle: NodeHandle | null = null;
     let knownPeerIds = new Set<string>();
     let peakPeers = 0;
+    let meshAnnouncedAt = 0;
     // Peer roster changes refresh the info/health views instantly - the
     // NO PEERS banner reacts in milliseconds instead of at the next 5s poll.
-    // Newly seen peers fire a peer-connected notification; a COLLAPSE from a
-    // session peak fires a system notification (early warning, 60s-deduped).
+    // Notifications are COALESCED: one quiet "mesh reached" entry when the
+    // roster goes 0 -> N (throttled, silent tier) instead of a panel row
+    // per peer - a busy room would otherwise bury real money events in
+    // join spam. A COLLAPSE from a session peak still fires a system
+    // notification (early warning, 60s-deduped).
     bootNode({
       onPeerChange: () => {
         void queryClient.invalidateQueries({ queryKey: ["info"] });
         void queryClient.invalidateQueries({ queryKey: ["health"] });
         const roster = handle?.peers() ?? [];
-        const fresh = roster.filter((p) => !knownPeerIds.has(p.id));
+        const hadNone = knownPeerIds.size === 0;
         knownPeerIds = new Set(roster.map((p) => p.id));
-        for (const p of fresh) {
+        if (roster.length > 0 && hadNone && Date.now() - meshAnnouncedAt > 10 * 60_000) {
+          meshAnnouncedAt = Date.now();
           notify(
             "peer_connected",
-            `Connected to peer ${shortAddr(p.id, 10, 4)}. Total: ${roster.length} peers`,
+            `Connected to the BitWeb mesh - ${roster.length} peer${roster.length === 1 ? "" : "s"} online`,
           );
         }
         // A sudden drop below half the session peak is what an eclipse

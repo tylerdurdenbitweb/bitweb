@@ -14,7 +14,7 @@ import { COIN, hashMeetsTarget, splitBlockReward } from "@contracts/protocol";
 import { encodeMessage, type WireTx } from "@contracts/wire";
 import { signTransfer, walletFromPrivHex } from "@/lib/bitweb";
 import { txidOfTransfer } from "./blockchain";
-import { MemoryStorage } from "./storage";
+import { MemoryStorage, type ChainStorage } from "./storage";
 
 const w1 = walletFromPrivHex("01".repeat(32))!;
 const w2 = walletFromPrivHex("02".repeat(32))!;
@@ -37,6 +37,16 @@ const BAKED: Record<string, { nonce: number; hash: string }> = {
   // block #2 paying w2, carrying the gossiped transfer - deterministic txid
   // (fixed keys, RFC-6979) => deterministic merkle, so this is stable
   // block #2 paying w1, coinbase only (the longest-chain regression below)
+  // the deep-fork convergence test: chain A = w1 solo blocks #3-#4 on top of
+  // the two cached w1 blocks; chain B = w2 solo blocks #1-#6 from genesis
+  "BTWB1|3|0000018c8f7cb7fd26d55c2201def5173ef6bbc90a1518e090d25a126609de77|310b1cbfa1b4759aa9d83cdae0aebfc002c52a1893cbbf7fd58ccb5184ca7d52|1787443203|": { nonce: 4550900, hash: "0000019c681bbcc35fa1ae47a1915afa8cbe42604cc0d35bdbecbb5d5003d4a6" },
+  "BTWB1|4|0000019c681bbcc35fa1ae47a1915afa8cbe42604cc0d35bdbecbb5d5003d4a6|762ff701143fc93acd1a0ccbb1043b43fde5191f659d4a69132e7281608a33e0|1787443204|": { nonce: 4021346, hash: "000001d55827e27b8df5e9938bb0667c4d298d07083ee7c18f139579c8898652" },
+  "BTWB1|1|c56c7b1e6bd77fb1cce41b3cb76d05a54c3bfd719db2942066daddf3a52352c3|61e058dc8dec4aa8f0b684827bd45414b1748b3e8f3a0f358ba8ac9016d201fb|1787443201|": { nonce: 4284016, hash: "00000045d6b8b5ed60f212cc69dbc19e50f74f13c619b69e1e97d005c94e195a" },
+  "BTWB1|2|00000045d6b8b5ed60f212cc69dbc19e50f74f13c619b69e1e97d005c94e195a|1a2510d09c5e4c75eb297132a9bb2f3cae562712a788c7b9d18540b6b50b2b0a|1787443202|": { nonce: 5250662, hash: "000000f002009d34e5027accf7e918a0094552aa094ce2781cf32d0043c4727c" },
+  "BTWB1|3|000000f002009d34e5027accf7e918a0094552aa094ce2781cf32d0043c4727c|bdc77bc0d41dd9ad7af49017e3dd9b86b5cfa1e83bb6567a9ccf87a737541a6d|1787443203|": { nonce: 4686527, hash: "0000021d0513855f6babf4add806c96b6ef344f82ec7f970da06d0623b39fde4" },
+  "BTWB1|4|0000021d0513855f6babf4add806c96b6ef344f82ec7f970da06d0623b39fde4|e0569768c1c5cb4c8b9d501da2cc65f920673d82c5bcd0ae3ef8072ff935fee8|1787443204|": { nonce: 4429040, hash: "000003d1d221a4cf7bf4293e1dcb6616f5e1f04be2cb8fd5d9de4a1217f07331" },
+  "BTWB1|5|000003d1d221a4cf7bf4293e1dcb6616f5e1f04be2cb8fd5d9de4a1217f07331|fa56d777a916401d8d1f326fbc505c398514f4feafdd92ac235626554432b443|1787443205|": { nonce: 1500807, hash: "000001728809202e4e43b2c8b9d2b7282689c01a270438fe7ce202e13a839df3" },
+  "BTWB1|6|000001728809202e4e43b2c8b9d2b7282689c01a270438fe7ce202e13a839df3|d0d06cec0b00d4d8324a43c58440cae4c7e3641469ffa4d1dda2e5c1658d3e09|1787443206|": { nonce: 11870100, hash: "000000b44ad3eef01c2e028dc5a97d6cb194bc5dda19d87aca6bdb48a1b7447e" },
 };
 
 function powSearch(prefixAscii: string, target: string): { nonce: number; hash: string } {
@@ -56,14 +66,19 @@ function powSearch(prefixAscii: string, target: string): { nonce: number; hash: 
 
 type Booted = Awaited<ReturnType<(typeof import("./client"))["bootNode"]>>;
 
-async function freshNode(tabId: string, channel?: string): Promise<Booted> {
+async function freshNode(
+  tabId: string,
+  channel?: string,
+  extra?: { maxReorgDepth?: number; storage?: ChainStorage },
+): Promise<Booted> {
   vi.resetModules();
   const client = await import("./client");
   const { BroadcastTransport } = await import("./transport");
   return client.bootNode({
-    storage: new MemoryStorage(),
+    storage: extra?.storage ?? new MemoryStorage(),
     transports: [new BroadcastTransport(tabId, channel)],
     webRtc: false,
+    maxReorgDepth: extra?.maxReorgDepth,
   });
 }
 
@@ -430,4 +445,74 @@ describe("mempool re-gossip - a tx made while alone still confirms", () => {
     solo.stop();
     late.stop();
   }, 120_000);
+});
+
+describe("deep fork beyond the walk-back budget - full resync convergence", () => {
+  it("a node stranded on a dead fork adopts the longer chain; supply converges exactly", async () => {
+    // A and B mine SEPARATE forks from genesis while isolated (different
+    // miners -> their chains differ from block 1 on; the fork point IS
+    // genesis). A reaches 4, B reaches 6. Both run with a walk-back budget
+    // of 2, so rollback can never reach the fork point - the exact state
+    // the pre-fix sync bug left real devices in, and the root cause of
+    // per-device supply drift: same-looking heights, different chains.
+    // Before the fix, A would strike the honest longer peer and both would
+    // stay forked forever.
+    const CH = "bitweb-test-deepfork";
+    const aloneA = await freshNode("df-a0", `${CH}-void-a`, { maxReorgDepth: 2 });
+    for (let i = 0; i < 4; i++) await mineWith(aloneA, w1.address);
+    const aForkTip = (await aloneA.info()).tipHash;
+    const aForkSupply = (await aloneA.info()).totalSupply;
+    expect((await aloneA.info()).height).toBe(4);
+    const aStorage = aloneA.storage;
+    aloneA.stop();
+
+    const aloneB = await freshNode("df-b0", `${CH}-void-b`, { maxReorgDepth: 2 });
+    for (let i = 0; i < 6; i++) await mineWith(aloneB, w2.address);
+    expect((await aloneB.info()).height).toBe(6);
+    const bStorage = aloneB.storage;
+    const bForkSupply = (await aloneB.info()).totalSupply;
+    aloneB.stop();
+
+    // sanity: the two forks genuinely disagree about the money supply
+    expect(aForkSupply).not.toBe(bForkSupply);
+
+    // both rejoin on the SHARED channel, carrying their forks (A boots
+    // LAST so the current module graph below is A's chain instance)
+    const b = await freshNode("df-b", CH, { storage: bStorage, maxReorgDepth: 2 });
+    const a = await freshNode("df-a", CH, { storage: aStorage, maxReorgDepth: 2 });
+    // the whole-chain replacement must ring the alarm hook exactly once
+    const replaced: Array<{ height: number; hash: string }> = [];
+    const { chainHooks } = await import("./chain");
+    chainHooks.onChainReplaced.push((tip) => replaced.push(tip));
+    await until(() => a.engine.peerCount() === 1 && b.engine.peerCount() === 1, 15_000);
+
+    // A (shorter fork) must adopt B's chain IN FULL...
+    const bInfo = await b.info();
+    await until(async () => (await a.info()).tipHash === bInfo.tipHash, 30_000);
+    expect((await a.info()).height).toBe(6);
+    expect(replaced).toEqual([{ height: 6, hash: bInfo.tipHash }]);
+
+    // ...B never moved...
+    expect((await b.info()).tipHash).toBe(bInfo.tipHash);
+
+    // ...and the money supply is now EXACTLY equal on both nodes - the
+    // regression this test guards. mined/burned derive from it.
+    const [ia, ib] = await Promise.all([a.info(), b.info()]);
+    expect(ia.totalSupply).toBe(ib.totalSupply);
+    expect(ia.totalBurned).toBe(ib.totalBurned);
+
+    // the dead fork is really gone: w1's fork rewards never existed on the
+    // adopted chain, on EITHER node
+    expect((await a.address(w1.address)).balance).toBe(0);
+    expect((await b.address(w1.address)).balance).toBe(0);
+    expect((await a.address(w2.address)).balance).toBe(
+      (await b.address(w2.address)).balance,
+    );
+    // A's old tip hash is not part of the adopted chain anymore
+    const adopted = await a.storage.blockAt(4);
+    expect(adopted?.hash).not.toBe(aForkTip);
+
+    a.stop();
+    b.stop();
+  }, 180_000);
 });

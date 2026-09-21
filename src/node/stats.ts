@@ -14,6 +14,8 @@ export interface NetStats {
   syncsStarted: number;
   /** Blocks rolled back during sync forks (bounded by MAX_REORG_DEPTH). */
   syncRollbacks: number;
+  /** Deep forks repaired by a full validate-and-adopt resync from a peer. */
+  syncDeepResyncs: number;
   /** Links closed for any reason (churn, timeouts, strikes, bans). */
   peerDrops: number;
 }
@@ -23,6 +25,7 @@ const counters: NetStats = {
   gossipRejected: 0,
   syncsStarted: 0,
   syncRollbacks: 0,
+  syncDeepResyncs: 0,
   peerDrops: 0,
 };
 

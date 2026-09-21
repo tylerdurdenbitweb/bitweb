@@ -468,6 +468,43 @@ const DEDUPE_CAP = 512;
 /** Presence announces: cadence, jitter and tombstone horizon. */
 const ID_RE = /^m-[0-9a-f]{12}$/;
 
+/**
+ * Presence announce payload. This is OUR application-level envelope (not
+ * the frozen consensus wire format): receivers ignore fields they do not
+ * know, so tip metadata rolls out safely across a mixed-version mesh. `h`
+ * is the announcer's chain tip height, `th` a short tip-hash prefix for
+ * diagnostics. A peer announcing a HIGHER tip than ours is worth syncing
+ * from - this is what wakes a stuck node when nobody is mining new blocks.
+ */
+export function encodeAnnounce(
+  selfId: string,
+  tip: { height: number; hash: string } | null,
+): string {
+  const m: Record<string, unknown> = { v: 1, t: "hi", id: selfId };
+  if (tip && Number.isInteger(tip.height) && tip.height >= 0) {
+    m.h = tip.height;
+    if (typeof tip.hash === "string" && /^[0-9a-f]{64}$/.test(tip.hash)) {
+      m.th = tip.hash.slice(0, 12);
+    }
+  }
+  return JSON.stringify(m);
+}
+
+/** Parse a lobby payload; null when malformed. Older nodes omit h/th. */
+export function decodeAnnounce(
+  m: Record<string, unknown>,
+): { id: string; height: number | null; tipHashPrefix: string | null } | null {
+  if (m.t !== "hi" || typeof m.id !== "string" || !ID_RE.test(m.id)) return null;
+  const h = m.h;
+  const height =
+    typeof h === "number" && Number.isInteger(h) && h >= 0 && h <= Number.MAX_SAFE_INTEGER
+      ? h
+      : null;
+  const th = m.th;
+  const tipHashPrefix = typeof th === "string" && /^[0-9a-f]{1,64}$/.test(th) ? th : null;
+  return { id: m.id, height, tipHashPrefix };
+}
+
 export interface MqttRelayOptions {
   announceMs?: number;
   ttlMs?: number;
@@ -535,6 +572,12 @@ export class MqttRelayTransport implements Transport {
   private stopped = false;
   private announceTimer: ReturnType<typeof setTimeout> | null = null;
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
+  /** Latest tip the engine wants us to advertise (null: pre-chain boot). */
+  private announcedTip: { height: number; hash: string } | null = null;
+
+  setAnnouncedTip(tip: { height: number; hash: string }): void {
+    this.announcedTip = tip;
+  }
 
   constructor(urls: readonly string[], opts?: MqttRelayOptions) {
     this.urls = urls;
@@ -638,7 +681,7 @@ export class MqttRelayTransport implements Transport {
 
   private announceOn(b: BrokerConn): void {
     dbg("announce via", b.client.url);
-    b.client.publish(LOBBY_TOPIC, utf8(JSON.stringify({ v: 1, t: "hi", id: this.selfId })));
+    b.client.publish(LOBBY_TOPIC, utf8(encodeAnnounce(this.selfId, this.announcedTip)));
   }
 
   private handleMqtt(topic: string, payload: Uint8Array): void {
@@ -652,10 +695,14 @@ export class MqttRelayTransport implements Transport {
     }
     if (!m || typeof m !== "object" || m.v !== 1) return;
     if (topic === LOBBY_TOPIC) {
-      if (m.t !== "hi" || typeof m.id !== "string" || !ID_RE.test(m.id)) return;
-      if (m.id === this.selfId) return; // brokers echo our own announce
-      dbg("presence", m.id);
-      this.learn(m.id);
+      const ann = decodeAnnounce(m);
+      if (!ann) return;
+      if (ann.id === this.selfId) return; // brokers echo our own announce
+      dbg("presence", ann.id);
+      this.learn(ann.id);
+      // Tip metadata is advisory: the engine cross-checks it against the
+      // verified hello before acting on it.
+      if (ann.height !== null) this.events?.onPeerTip?.(ann.id, ann.height, ann.tipHashPrefix);
       return;
     }
     if (topic === `${INBOX_PREFIX}${this.selfId}`) {

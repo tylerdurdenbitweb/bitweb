@@ -112,8 +112,11 @@ a valid attestation, the entire 20% pool is burned instead.
 - Miner cooldown enforced (1 block wait, from block 2,000).
 - PoP attestations verified cryptographically.
 - All fees burned.
-- Deep-reorg finality: forks deeper than 32 blocks are
-  rejected, so confirmed history is effectively checkpointed.
+- Deep-reorg discipline: fork walk-backs are bounded (32 blocks);
+  beyond that the node downloads the candidate chain in full,
+  revalidates every block and the whole ledger in memory, and only
+  then adopts it - so a longer valid chain is never refused and no
+  device can stay stranded on a dead fork.
 
 ## Survival & Resilience
 
@@ -327,9 +330,10 @@ Defended in code (and where):
 
 - Fake or rewritten history: every block is fully validated (PoW,
   linkage, merkle, full ledger replay); checkpoints pin known-good
-  heights; reorgs deeper than 32 blocks are refused; chain imports
-  validate everything before writing anything and reject shorter
-  chains by default.
+  heights; walk-back reorgs stay within the 32-block window, and
+  deeper divergence is healed by a fully-proven validate-then-adopt
+  resync instead of blind trust; chain imports validate everything
+  before writing anything and reject shorter chains by default.
 - Sybil floods: a mutual proof-of-work handshake (~65k hashes) gates
   every peer slot; 32 slots max; invalid data earns strikes (3 =
   dropped); offline peers are never punished.

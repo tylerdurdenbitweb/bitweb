@@ -40,6 +40,12 @@ export interface TransportEvents {
   onOpen(peerId: string): void;
   onMessage(peerId: string, data: string): void;
   onClose(peerId: string): void;
+  /**
+   * Optional: a presence announce carried the peer's chain tip height.
+   * Transports without a presence channel (or peers running older builds)
+   * simply never fire this - the engine falls back to hello/gossip heights.
+   */
+  onPeerTip?(peerId: string, height: number, tipHashPrefix: string | null): void;
 }
 
 export interface Transport {
@@ -55,6 +61,12 @@ export interface Transport {
   close(peerId: string): void;
   /** Currently open links. */
   links(): string[];
+  /**
+   * Optional: the tip we advertise in our own presence announces. The
+   * engine pushes it on every tip change; transports without a presence
+   * channel never implement it.
+   */
+  setAnnouncedTip?(tip: { height: number; hash: string }): void;
 }
 
 export function randomPeerId(prefix: string): string {

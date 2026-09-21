@@ -57,6 +57,12 @@ export interface BootOptions {
   mqttUrls?: readonly string[];
   /** Called whenever the peer roster changes. */
   onPeerChange?: () => void;
+  /**
+   * Tests only: shrink the per-round fork walk-back budget so the deep
+   * resync path is reachable with a handful of mined blocks. Production
+   * always uses the consensus MAX_REORG_DEPTH.
+   */
+  maxReorgDepth?: number;
 }
 
 export interface NodeHandle {
@@ -222,7 +228,7 @@ async function bootFresh(opts: BootOptions = {}): Promise<NodeHandle> {
     }
 
     // 5. engine
-    engine = new P2pEngine(transports);
+    engine = new P2pEngine(transports, { maxReorgDepth: opts.maxReorgDepth });
     try {
       await engine.start(opts.onPeerChange);
     } catch (err) {

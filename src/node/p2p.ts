@@ -10,7 +10,10 @@
  *               identities costs real work per slot
 
  *   sync        getBlocks/blocks in batches of 16, longest valid chain wins,
- *               automatic rollback to the fork point (<= MAX_REORG_DEPTH)
+ *               automatic rollback to the fork point (<= MAX_REORG_DEPTH);
+ *               deeper forks trigger a full validate-then-adopt resync, so
+ *               NO valid longer chain is ever refused and no honest peer is
+ *               ever punished for simply having mined on a stale fork
  *   gossip      every accepted block/tx is relayed to all other links
  *   heartbeat   ping every 30s; 3 misses -> dropped
  *   fair play   strikes ONLY for invalid data (3 -> dropped); a peer that is
@@ -47,6 +50,7 @@ import {
 import {
   ChainValidationError,
   admitTransfer,
+  adoptRemoteChain,
   applyWireBlock,
   chainHooks,
   getGenesisHash,
@@ -185,10 +189,20 @@ export class P2pEngine {
   private transports: Transport[];
   /** Test hook: shrink the handshake deadline without editing the constant. */
   private challengeTimeoutMs: number;
+  /**
+   * Fork walk-back budget per sync round before the deep resync engages.
+   * Consensus default MAX_REORG_DEPTH; tests inject a small value to reach
+   * the deep path without mining dozens of blocks.
+   */
+  private maxReorgDepth: number;
 
-  constructor(transports: Transport[], opts: { challengeTimeoutMs?: number } = {}) {
+  constructor(
+    transports: Transport[],
+    opts: { challengeTimeoutMs?: number; maxReorgDepth?: number } = {},
+  ) {
     this.transports = transports;
     this.challengeTimeoutMs = opts.challengeTimeoutMs ?? SYBIL_CHALLENGE_TIMEOUT_MS;
+    this.maxReorgDepth = opts.maxReorgDepth ?? MAX_REORG_DEPTH;
   }
 
   async start(onPeerChange?: () => void): Promise<void> {
@@ -203,6 +217,7 @@ export class P2pEngine {
       onOpen: (id) => this.handleOpen(id),
       onMessage: (id, data) => this.handleMessage(id, data),
       onClose: (id) => this.handleClose(id),
+      onPeerTip: (id, height, tipHashPrefix) => this.handlePeerTip(id, height, tipHashPrefix),
     };
     // Each transport is started independently: one failing (e.g. a blocked
     // signaling rendezvous) must never take the others down with it.
@@ -214,6 +229,7 @@ export class P2pEngine {
         console.warn(`[p2p] transport "${t.kind}" failed to start - continuing without it:`, err);
       }
     }
+    this.pushAnnouncedTip();
     this.heartbeat = setInterval(() => this.heartbeatRound(), HEARTBEAT_MS);
     // Peers re-sign and re-gossip their attestation on this cadence, keeping
     // every potential miner's cache inside the 300s freshness window.
@@ -224,8 +240,43 @@ export class P2pEngine {
 
   // Kept as fields so stop() can unregister the exact same references -
   // a stopped engine must never keep gossiping through the chain hooks.
-  private onBlockHook = (height: number): void => void this.gossipBlock(height);
+  private onBlockHook = (height: number): void => {
+    this.pushAnnouncedTip();
+    void this.gossipBlock(height);
+  };
   private onTxHook = (t: TransferInput): void => this.gossipTx(t);
+
+  /**
+   * Advertise our fresh tip in presence announces (transports that have a
+   * lobby - currently MQTT). Behind peers see the height within one
+   * announce cadence and re-sync even when NO new block is being mined.
+   */
+  private pushAnnouncedTip(): void {
+    void getTipSummary()
+      .then((tip) => {
+        for (const t of this.activeTransports) t.setAnnouncedTip?.(tip);
+      })
+      .catch(() => undefined);
+  }
+
+  /**
+   * A presence announce carried the peer's tip height. Advisory only until
+   * the peer is verified (announces are unauthenticated by design); then a
+   * height above our tip is a reason to sync even if their hello is long
+   * past and no new block is flowing.
+   */
+  private handlePeerTip(id: string, height: number, tipHashPrefix: string | null): void {
+    if (this.stopped) return;
+    void tipHashPrefix; // diagnostic today; reserved for fork forensics
+    if (height > this.bestKnown) this.bestKnown = height;
+    const p = this.peers.get(id);
+    if (!p || p.banned || !p.verified) return;
+    void getTipSummary()
+      .then((tip) => {
+        if (height > tip.height && !this.stopped) this.requestSync(id);
+      })
+      .catch(() => undefined);
+  }
 
   stop(): void {
     this.stopped = true;
@@ -789,6 +840,12 @@ export class P2pEngine {
     try {
       await applyWireBlock(wb);
       if (wb.height > this.bestKnown) this.bestKnown = wb.height;
+      this.pushAnnouncedTip(); // our tip moved - announce it on the lobbies
+      // Relay once to every OTHER link: gossip must be multi-hop, or nodes
+      // not directly linked to the miner never see the block and stay
+      // behind until some later sync trigger. Receivers dedupe by hash,
+      // so the mesh cost is one copy per link per block.
+      this.broadcast({ type: "block", block: wb }, p.id);
     } catch (err) {
       if (!(err instanceof ChainValidationError)) throw err;
       if (err.message === "block does not extend our tip") {
@@ -894,6 +951,9 @@ export class P2pEngine {
 
   private heartbeatRound(): void {
     if (this.stopped) return;
+    // Keep presence announces fresh: imports, prunes and deep resyncs move
+    // the tip without firing block hooks.
+    this.pushAnnouncedTip();
     for (const p of this.peers.values()) {
       if (p.banned) continue;
       if (p.awaitingPong) {
@@ -918,6 +978,24 @@ export class P2pEngine {
       this.regossipTick = 0;
       void this.shareMempool(null);
     }
+    // Stuck-behind watchdog: hellos, gossip and announce tips raise
+    // bestKnown, but a sync that died mid-flight (mobile blip, peer
+    // timeout, broker reconnect) otherwise waited for the NEXT block or
+    // peer before retrying - a node could sit behind forever on a quiet
+    // network. Re-check every heartbeat and re-engage the longest peer.
+    if (!this.syncInFlight && this.syncQueued === null) void this.retrySyncIfBehind();
+  }
+
+  private async retrySyncIfBehind(): Promise<void> {
+    if (this.stopped || this.syncInFlight || this.syncQueued !== null) return;
+    const tip = await getTipSummary();
+    let best: PeerState | null = null;
+    for (const p of this.peers.values()) {
+      if (p.banned || !p.verified || !p.hello) continue;
+      if (p.hello.height <= tip.height) continue;
+      if (!best || p.hello.height > (best.hello?.height ?? 0)) best = p;
+    }
+    if (best) this.requestSync(best.id);
   }
 
   /**
@@ -998,11 +1076,21 @@ export class P2pEngine {
     } finally {
       done();
       this.syncing = false;
+      // Our tip may have moved (batches, rollbacks or a deep resync):
+      // re-announce it and relay the tip block once, so the rest of the
+      // mesh converges on the chain we just adopted without waiting for
+      // the next mined block.
+      this.pushAnnouncedTip();
+      void getTipSummary()
+        .then((t) => {
+          if (!this.stopped && t.height > 0) void this.gossipBlock(t.height);
+        })
+        .catch(() => undefined);
     }
   }
 
   private async syncFromPeerInner(peerId: string): Promise<void> {
-    let rollbackBudget = MAX_REORG_DEPTH;
+    let rollbackBudget = this.maxReorgDepth;
     bumpStat("syncsStarted");
     // Each pass either extends our tip or rolls it back (bounded) - so it
     // always converges to the peer's chain if that chain is valid.
@@ -1028,15 +1116,23 @@ export class P2pEngine {
         if (wb.height <= cur.height) continue; // stale/side-chain block
         if (wb.height === cur.height + 1 && wb.prevHash !== cur.hash) {
           // fork - step back one block and re-request from the new tip
-          if (cur.height === 0 || rollbackBudget <= 0) {
-            this.strike(peerId, "fork beyond reorg depth");
-            return;
+          if (cur.height > 0 && rollbackBudget > 0) {
+            await rollbackToHeight(cur.height - 1);
+            bumpStat("syncRollbacks");
+            rollbackBudget -= 1;
+            restart = true;
+            break;
           }
-          await rollbackToHeight(cur.height - 1);
-          bumpStat("syncRollbacks");
-          rollbackBudget -= 1;
-          restart = true;
-          break;
+          // The fork point is beyond the walk-back budget (or the fork
+          // diverged at genesis itself). A fork that deep used to earn the
+          // HONEST peer a strike and leave both sides stranded forever -
+          // the root cause of devices showing the same heights but
+          // different supply. "Longest valid chain wins" still governs:
+          // if the peer advertises a strictly longer chain, download it in
+          // full, prove it in memory and adopt it atomically.
+          if (await this.tryDeepResync(peerId)) return;
+          this.strike(peerId, "fork beyond reorg depth");
+          return;
         }
         // gap ahead of us - re-request from our current tip
         restart = true;
@@ -1044,6 +1140,61 @@ export class P2pEngine {
       }
       if (restart) continue;
       if (batch.length < P2P_BLOCK_BATCH) return; // peer's tip reached
+    }
+  }
+
+  /**
+   * Deep-fork repair. Downloads the peer's ENTIRE chain from genesis in
+   * batches, then adopts it via adoptRemoteChain - which revalidates every
+   * hash, target, timestamp, signature, PoP split and the whole monetary
+   * ledger in memory BEFORE touching local storage. Nothing is destroyed
+   * until a fully-proven, strictly-longer replacement exists, so a peer
+   * serving garbage (or a pruned peer that cannot serve its early history)
+   * never costs us our valid chain.
+   *
+   * Returns true when the situation is resolved one way or another (chain
+   * adopted, or the peer struck for serving an invalid chain); false when
+   * the peer cannot offer a provable longer chain and nothing was touched.
+   */
+  private async tryDeepResync(peerId: string): Promise<boolean> {
+    const advertised = this.peers.get(peerId)?.hello?.height ?? 0;
+    const tip = await getTipSummary();
+    if (advertised <= tip.height) return false; // not longer - no mandate to adopt
+
+    const blocks: WireBlock[] = [];
+    let next = 0;
+    for (;;) {
+      const chunk = await this.requestBlocks(peerId, next, P2P_BLOCK_BATCH);
+      if (chunk.length === 0) break; // peer went quiet - judge what we have
+      if (chunk[0].height !== next) break; // gap: pruned peers cannot serve full history
+      blocks.push(...chunk);
+      next = blocks[blocks.length - 1].height + 1;
+      setChainGateDetail(
+        `deep fork repair: fetching block #${blocks[blocks.length - 1].height.toLocaleString("en-US")}`,
+      );
+      if (chunk.length < P2P_BLOCK_BATCH) break;
+    }
+    // Must start at OUR genesis and beat our tip, even truncated: a partial
+    // download is a strict prefix of the peer's chain and still provable.
+    if (blocks.length === 0 || blocks[0].height !== 0) return false;
+    if (blocks[blocks.length - 1].height <= tip.height) return false;
+
+    try {
+      const height = await adoptRemoteChain(blocks);
+      bumpStat("syncDeepResyncs");
+      console.info(
+        `[p2p] deep fork repaired: adopted ${peerId}'s chain, new tip #${height} ` +
+          `(was #${tip.height} on a divergent fork)`,
+      );
+      if (height > this.bestKnown) this.bestKnown = height;
+      return true;
+    } catch (err) {
+      // A chain that FAILS full validation is an offence - unlike silence.
+      this.strike(
+        peerId,
+        `deep resync: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return true;
     }
   }
 }

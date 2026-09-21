@@ -10,7 +10,7 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 import WebSocket, { WebSocketServer, createWebSocketStream } from "ws";
 import { Aedes } from "aedes";
-import { MiniMqttClient, MqttRelayTransport, type MqttSocketLike } from "./mqtt";
+import { MiniMqttClient, MqttRelayTransport, decodeAnnounce, encodeAnnounce, type MqttSocketLike } from "./mqtt";
 import type { TransportEvents } from "./transport";
 
 interface RunningBroker {
@@ -367,5 +367,58 @@ describe("MqttRelayTransport - public-room mesh", () => {
     // the backfilled link must be the previously-waiting guest
     const waiting = guests.find((g) => g !== guests[victimIdx] && !linked.includes(g.selfId));
     expect(waiting && tHost.links().includes(waiting.selfId)).toBe(true);
+  });
+});
+
+describe("presence announces carry the chain tip (mixed-version safe)", () => {
+  it("encode/decode round-trip with and without tip metadata", () => {
+    const id = "m-0123456789ab";
+    const hash = "ab".repeat(32);
+
+    // full payload: height + hash prefix
+    const full = decodeAnnounce(JSON.parse(encodeAnnounce(id, { height: 42, hash })));
+    expect(full).toEqual({ id, height: 42, tipHashPrefix: hash.slice(0, 12) });
+
+    // pre-chain boot: no tip set -> plain announce, still parses
+    const bare = decodeAnnounce(JSON.parse(encodeAnnounce(id, null)));
+    expect(bare).toEqual({ id, height: null, tipHashPrefix: null });
+
+    // an OLD node's announce (no h/th fields at all) must still parse
+    const legacy = decodeAnnounce({ v: 1, t: "hi", id });
+    expect(legacy).toEqual({ id, height: null, tipHashPrefix: null });
+
+    // genesis tip is a valid announce (height 0, falsy but present)
+    const zero = decodeAnnounce(JSON.parse(encodeAnnounce(id, { height: 0, hash })));
+    expect(zero?.height).toBe(0);
+  });
+
+  it("garbage announces and garbage tip fields are rejected or stripped", () => {
+    const id = "m-0123456789ab";
+    // malformed envelopes (the transport checks `v` before decoding)
+    expect(decodeAnnounce({ t: "hi" })).toBeNull();
+    expect(decodeAnnounce({ t: "bye", id })).toBeNull();
+    expect(decodeAnnounce({ t: "hi", id: "not-an-id" })).toBeNull();
+    // tip fields that fail shape checks are stripped, never trusted
+    const neg = decodeAnnounce(JSON.parse(encodeAnnounce(id, { height: -5, hash: "zz" })));
+    expect(neg).toEqual({ id, height: null, tipHashPrefix: null });
+    const hacked = decodeAnnounce({ t: "hi", id, h: 3.5, th: "not hex!" });
+    expect(hacked).toEqual({ id, height: null, tipHashPrefix: null });
+  });
+
+  it("a peer's announced tip reaches the engine over a real broker", async () => {
+    const b = await broker();
+    const tips: Array<{ id: string; height: number; th: string | null }> = [];
+    const a = collector();
+    const cEvents: TransportEvents = {
+      ...collector().events,
+      onPeerTip: (id, height, th) => tips.push({ id, height, th }),
+    };
+    const ta = makeTransport([b.url]);
+    const tc = makeTransport([b.url]);
+    const tipHash = "cd".repeat(32);
+    ta.setAnnouncedTip({ height: 777, hash: tipHash });
+    await Promise.all([ta.start(a.events), tc.start(cEvents)]);
+    await until(() => tips.some((t) => t.id === ta.selfId && t.height === 777));
+    expect(tips.find((t) => t.id === ta.selfId)?.th).toBe(tipHash.slice(0, 12));
   });
 });

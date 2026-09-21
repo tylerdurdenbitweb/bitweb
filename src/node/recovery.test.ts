@@ -94,8 +94,75 @@ describe("boot state recovery", () => {
     expect((await getInfo()).totalSupply).toBe(supplyBefore);
   });
 
+  /** The supply the BLOCKS themselves imply: sum(reward + pop - fees). */
+  async function blockImpliedSupply(): Promise<number> {
+    const tip = (await storage.tip())!;
+    let sum = 0;
+    for (let h = 1; h <= tip.height; h++) {
+      const b = (await storage.blockAt(h))!;
+      sum += b.reward + b.popTransfers.reduce((x, p) => x + p.amount, 0) - b.feesBurned;
+    }
+    return sum;
+  }
+
+  it("a corrupted totalSupply meta heals back to the block-implied value", async () => {
+    // Drift left behind by any historical version: the meta row no longer
+    // matches the chain. Balances are INTACT - a rebuild must restore the
+    // meta without touching (let alone double-crediting) a single balance.
+    const expected = await blockImpliedSupply();
+    expect((await getInfo()).totalSupply).toBe(expected);
+    const balA = (await getAddressOverview(minerA.address)).balance;
+
+    await storage.transact(async (tx) => {
+      await tx.setMeta("totalSupply", String(expected + 12_345));
+    });
+    await recoverChainState();
+
+    expect((await getInfo()).totalSupply).toBe(expected);
+    expect((await getAddressOverview(minerA.address)).balance).toBe(balA);
+  });
+
+  it("a single corrupted balance heals, supply untouched", async () => {
+    const expected = await blockImpliedSupply();
+    const balA = (await getAddressOverview(minerA.address)).balance;
+
+    await storage.transact(async (tx) => {
+      const acc = (await tx.account(minerA.address))!;
+      await tx.putAccount({ ...acc, balance: acc.balance + 1 });
+    });
+    await recoverChainState();
+
+    expect((await getInfo()).totalSupply).toBe(expected);
+    expect((await getAddressOverview(minerA.address)).balance).toBe(balA);
+  });
+
+  it("supply and balances drifted TOGETHER still heals (the old check missed this)", async () => {
+    // The pre-fix invariant was only sum(balances) === totalSupply: drift
+    // that moved BOTH caches by the same amount passed it and lived
+    // forever - which is exactly how devices ended up showing different
+    // supply for the same chain. The block-implied cross-check catches it.
+    const expected = await blockImpliedSupply();
+    const balA = (await getAddressOverview(minerA.address)).balance;
+
+    await storage.transact(async (tx) => {
+      const acc = (await tx.account(minerA.address))!;
+      await tx.putAccount({ ...acc, balance: acc.balance + 777 });
+      await tx.setMeta("totalSupply", String(expected + 777));
+    });
+    // sanity: the OLD invariant alone would call this state healthy
+    const accounts = await storage.allAccounts();
+    const held = accounts.reduce((s, a) => s + a.balance, 0);
+    expect(held).toBe(expected + 777);
+
+    await recoverChainState();
+
+    expect((await getInfo()).totalSupply).toBe(expected);
+    expect((await getAddressOverview(minerA.address)).balance).toBe(balA);
+  });
+
   it("rebuilds from the latest snapshot even when early blocks are gone", async () => {
     // The exact row the SNAPSHOT_INTERVAL hook persists every 1,000 blocks.
+    // NOTE: destructive (block 1 is deleted) - must run LAST in this file.
     const tip2 = (await storage.tip())!;
     expect(tip2.height).toBe(2);
     const accountsAt2 = await storage.allAccounts();

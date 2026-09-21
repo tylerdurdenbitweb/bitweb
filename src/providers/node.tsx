@@ -10,6 +10,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { bootNode, type NodeHandle } from "@/node/client";
+import { chainHooks } from "@/node/chain";
 import { getChainGateState, subscribeChainGate, type ChainGateState } from "@/node/chain-gate";
 import { notify } from "@/lib/notify";
 import { resetLocalData } from "@/lib/reset";
@@ -54,6 +55,21 @@ export function NodeProvider({ children }: { children: ReactNode }) {
     let knownPeerIds = new Set<string>();
     let peakPeers = 0;
     let meshAnnouncedAt = 0;
+    // A whole-chain replacement (deep-fork repair adopting a proven-longer
+    // remote chain) is what a history-rewrite attempt looks like from the
+    // inside. Consensus must follow the longest valid chain - but the human
+    // must HEAR about it: audible tier, with the heights, so an unexpected
+    // big rewrite can never pass silently.
+    const onReplaced = (tip: { height: number; hash: string }) => {
+      void queryClient.invalidateQueries({ queryKey: ["info"] });
+      void queryClient.invalidateQueries({ queryKey: ["health"] });
+      notify(
+        "error",
+        `Chain replaced by a longer valid chain - new height #${tip.height.toLocaleString("en-US")} ` +
+          `(tip ${tip.hash.slice(0, 12)}...). If you did not expect a big rewrite, check the network.`,
+      );
+    };
+    chainHooks.onChainReplaced.push(onReplaced);
     // Peer roster changes refresh the info/health views instantly - the
     // NO PEERS banner reacts in milliseconds instead of at the next 5s poll.
     // Notifications are COALESCED: one quiet "mesh reached" entry when the
@@ -112,6 +128,8 @@ export function NodeProvider({ children }: { children: ReactNode }) {
       });
     return () => {
       cancelled = true;
+      const i = chainHooks.onChainReplaced.indexOf(onReplaced);
+      if (i >= 0) chainHooks.onChainReplaced.splice(i, 1);
       handle?.stop();
     };
   }, []);

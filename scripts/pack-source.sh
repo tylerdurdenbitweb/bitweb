@@ -22,7 +22,7 @@ VERSION="$(node -p "require('./package.json').version" 2>/dev/null || echo "0.0.
   echo "BITWEB SOURCE SNAPSHOT"
   echo "built_at_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "version: ${VERSION}"
-  echo "chain: bitweb-testnet-1"
+  echo "chain: bitweb-mainnet-1"
 } > "$MARKER"
 
 zip -r "$TMP" \

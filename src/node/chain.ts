@@ -77,6 +77,14 @@ function bad(msg: string): never {
 export const chainHooks = {
   onBlockAccepted: [] as Array<(height: number) => void>,
   onTxAccepted: [] as Array<(t: TransferInput) => void>,
+  /**
+   * Fired when the WHOLE chain was replaced by a validated longer remote
+   * chain (deep-fork repair). Routine one-block applies and bounded
+   * rollbacks never fire this - a fire means history moved a lot, which is
+   * exactly what a rewrite attempt looks like. The UI turns it into a loud
+   * notification: consensus stays silent, the human gets told.
+   */
+  onChainReplaced: [] as Array<(tip: { height: number; hash: string }) => void>,
 };
 
 function fireBlockAccepted(height: number): void {
@@ -240,28 +248,56 @@ async function bootstrapGenesis(): Promise<void> {
 /**
  * Boot-time integrity check + state recovery. The blocks and transactions
  * stores are the source of truth; the balances table and totalSupply are
- * derived from them. The invariant `sum(balances) === totalSupply` must
- * always hold - if partial storage loss ever breaks it (quota eviction,
- * profile damage), rebuild the derived state instead of booting corrupted:
- * restore the latest local snapshot, then replay every block after it
- * through the exact same application path as live blocks.
+ * derived from them. Two invariants must always hold:
+ * `sum(balances) === totalSupply` AND `totalSupply ===` the supply implied
+ * by the stored blocks themselves. If partial storage loss (or drift left
+ * behind by any historical version) ever breaks either, rebuild the derived
+ * state instead of booting corrupted: zero every account, then replay every
+ * block through the exact same application path as live blocks. The replay
+ * starts at genesis when the full block history is present; when early
+ * blocks are gone (pruned/evicted), the latest state snapshot above the gap
+ * is the only remaining anchor and is used as the base instead.
  */
 async function recoverChainStateIfNeeded(s: ChainStorage): Promise<void> {
   const blocks = await s.blockCount();
   if (blocks <= 1) return; // genesis-only chain has no derived state to lose
+  const tip = await s.tip();
+  if (!tip) return;
   const supplyRow = await s.getMeta("totalSupply");
   const supply = supplyRow === undefined ? 0 : Number(supplyRow);
   const accounts = await s.allAccounts();
   const held = accounts.reduce((sum, a) => sum + a.balance, 0);
-  if (held === supply) return; // invariant intact - healthy boot
 
-  console.warn(
-    `[bitweb] derived state broken (balances sum ${held} != supply ${supply}) - rebuilding`,
-  );
-  const tip = await s.tip();
-  if (!tip) return;
-  const snap = await s.latestSnapshot();
+  // The blocks store is the ONLY trust anchor: totalSupply is a cache of
+  // `sum(reward + popTransfers - feesBurned)` over every block, and balances
+  // are a cache of the same ledger. Recompute the block-implied supply and
+  // demand BOTH caches agree with it. Any drift - from any version, any
+  // cause - heals here on boot, deterministically, identically on every
+  // device that holds the same chain.
+  let expected: number | null = 0;
+  for (let h = 1; h <= tip.height; h++) {
+    const b = await s.blockAt(h);
+    if (!b) {
+      expected = null;
+      break;
+    }
+    expected += b.reward + b.popTransfers.reduce((sum, pt) => sum + pt.amount, 0) - b.feesBurned;
+  }
+  if (held === supply && (expected === null || expected === supply)) return; // healthy boot
+
+  // When the blocks row scan is complete it is ground truth: replay from
+  // genesis and IGNORE state snapshots - a snapshot written by the same
+  // path that drifted would re-import the drift. When early history is
+  // unavailable (pruned away or evicted), the latest snapshot ABOVE the gap
+  // is the only remaining anchor: heal from it instead.
+  const snap = expected === null ? ((await s.latestSnapshot()) ?? null) : null;
   const replayFrom = snap ? snap.height + 1 : 1;
+  if (snap && snap.height >= tip.height) return; // nothing replayable above it
+  console.warn(
+    `[bitweb] derived state broken (balances sum ${held}, supply ${supply}` +
+      `${expected === null ? "" : `, blocks imply ${expected}`}) - rebuilding` +
+      (snap ? ` from snapshot #${snap.height}` : " from the blocks store"),
+  );
 
   // Read every row the replay needs BEFORE the write transaction: replayed
   // heights are deleted and re-applied below, and a read during the tx would
@@ -302,6 +338,13 @@ async function recoverChainStateIfNeeded(s: ChainStorage): Promise<void> {
   }
 
   await s.transact(async (tx) => {
+    // Zero ALL derived state first: the replay below ADDS every block's
+    // deltas, so any surviving balance/nonce would be counted twice. In the
+    // snapshot fallback the snapshot's own rows are then restored as the
+    // base. The result is a pure function of trusted anchors - nothing else.
+    for (const acc of await tx.allAccounts()) {
+      await tx.putAccount({ ...acc, balance: 0, nonce: 0, blocksMined: 0 });
+    }
     if (snap) {
       for (const acc of snap.accounts) await tx.putAccount(acc);
       await tx.setMeta("totalSupply", String(snap.totalSupply));
@@ -2155,6 +2198,49 @@ export async function importChain(data: unknown, opts?: ImportOptions): Promise<
   } finally {
     gateDone();
   }
+}
+
+/**
+ * Adopt a fully-downloaded REMOTE chain (deep-fork repair during sync).
+ * Same zero-trust discipline as importChain: the candidate is proven in
+ * memory FIRST (validateExportBlocks replays every hash, target, timestamp,
+ * signature, PoP split and the whole monetary ledger), and local storage is
+ * wiped only after that proof - so a peer serving garbage can never destroy
+ * a valid local chain. The caller (p2p sync) holds the chain gate and has
+ * already confirmed the remote chain is strictly longer. Returns the new
+ * tip height.
+ */
+export function adoptRemoteChain(blocks: WireBlock[]): Promise<number> {
+  if (blocks.length === 0) throw new ChainValidationError("empty remote chain");
+  return withLock(async () => {
+    validateExportBlocks(blocks);
+    const tip = await getTip();
+    if (tip.height > 0) await resetChainToGenesisLocked();
+    try {
+      const total = blocks.length - 1;
+      for (let i = 1; i < blocks.length; i++) {
+        await applyWireBlockLocked(blocks[i]);
+        // 32-block cadence: progress stays live without one event per block
+        if (i % 32 === 0 || i === total) {
+          setChainGateDetail(`applying block ${i}/${total}`);
+        }
+      }
+    } catch (err) {
+      // Static validation already passed, so this is unreachable in
+      // practice - but if it ever happens, nothing partial may survive.
+      await resetChainToGenesisLocked();
+      throw err;
+    }
+    const newTip = blocks[blocks.length - 1];
+    for (const cb of chainHooks.onChainReplaced) {
+      try {
+        cb({ height: newTip.height, hash: newTip.hash });
+      } catch {
+        /* notifications must never break consensus */
+      }
+    }
+    return newTip.height;
+  });
 }
 
 /**

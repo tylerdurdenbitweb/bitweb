@@ -155,6 +155,11 @@ describe("two full nodes over ONE MQTT room (no webrtc, no tab mesh)", () => {
     );
     const infoB = await nodeB.info();
     expect(infoB.tipHash).toBe(infoA.tipHash);
+    // an identical tip must imply an identical LEDGER: supply (and the
+    // burned/mined values derived from it) agree on both nodes - the exact
+    // cross-device divergence this guards
+    expect(infoB.totalSupply).toBe(infoA.totalSupply);
+    expect(infoB.totalBurned).toBe(infoA.totalBurned);
 
     // and the link that carried it all is still up
     expect(nodeA.peers().some((p) => p.transport === "mqtt")).toBe(true);

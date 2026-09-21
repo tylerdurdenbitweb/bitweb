@@ -1,4 +1,0 @@
-BITWEB SOURCE SNAPSHOT
-built_at_utc: 2026-08-19T11:39:24Z
-version: 0.0.0
-chain: bitweb-testnet-1

@@ -238,7 +238,7 @@ export function SupplyLogo({
       {/* terminal-styled tooltip: hover AND keyboard focus */}
       <div
         role="tooltip"
-        className="pointer-events-none absolute left-1/2 top-full z-50 mt-1 -translate-x-1/2 whitespace-nowrap border border-neutral-600 bg-black px-3 py-1.5 text-[clamp(11px,3.2vw,14px)] font-semibold tracking-[0.15em] text-white opacity-0 transition-opacity [text-shadow:0_0_6px_rgba(255,255,255,0.45)] group-hover:opacity-100 group-focus-within:opacity-100"
+        className="pointer-events-none absolute bottom-full left-1/2 z-50 mb-1 -translate-x-1/2 whitespace-nowrap border border-neutral-600 bg-black px-3 py-1.5 text-[clamp(11px,3.2vw,14px)] font-semibold tracking-[0.15em] text-white opacity-0 transition-opacity [text-shadow:0_0_6px_rgba(255,255,255,0.45)] group-hover:opacity-100 group-focus-within:opacity-100"
       >
         {tip}
       </div>

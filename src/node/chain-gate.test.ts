@@ -129,6 +129,38 @@ describe("chain gate - the passive-mode switch", () => {
     expect(gate.getChainGateState().detail).toBeNull(); // no leak
   });
 
+  it("structured progress: lives inside a burst, clamps, clears on release", async () => {
+    const { gate } = await freshAll();
+    gate.setChainGateProgress(3, 10); // no burst - dropped
+    expect(gate.getChainGateState().progress).toBeNull();
+
+    const done = gate.beginChainUpdate("op");
+    gate.setChainGateProgress(3, 10);
+    expect(gate.getChainGateState().progress).toEqual({ current: 3, total: 10 });
+    // out-of-range values clamp into the bar, garbage becomes indeterminate
+    gate.setChainGateProgress(99, 10);
+    expect(gate.getChainGateState().progress).toEqual({ current: 10, total: 10 });
+    gate.setChainGateProgress(Number.NaN, 10);
+    expect(gate.getChainGateState().progress).toBeNull();
+    gate.setChainGateProgress(5, 10);
+    gate.clearChainGateProgress();
+    expect(gate.getChainGateState().progress).toBeNull();
+    gate.setChainGateProgress(7, 10);
+    done();
+    expect(gate.getChainGateState().progress).toBeNull(); // no leak past the burst
+  });
+
+  it("a nested burst starts clean: progress from a finished burst never bleeds in", async () => {
+    const { gate } = await freshAll();
+    const done1 = gate.beginChainUpdate("first");
+    gate.setChainGateProgress(8, 10);
+    done1();
+    const done2 = gate.beginChainUpdate("second");
+    expect(gate.getChainGateState().progress).toBeNull();
+    expect(gate.getChainGateState().detail).toBeNull();
+    done2();
+  });
+
   it("subscribers see every emission as a fresh snapshot; unsubscribe silences", async () => {
     const { gate } = await freshAll();
     const { states, unsub } = recorder(gate);

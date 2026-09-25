@@ -39,6 +39,7 @@ import { WsRelayTransport, relayUrlsFromRuntime } from "./relay";
 import { MqttRelayTransport, mqttUrlsFromRuntime } from "./mqtt";
 import { getNetStats } from "./stats";
 import { beginChainUpdate, setChainGateDetail } from "./chain-gate";
+import { clearBootProgress, setBootPhase, setBootWindow } from "./boot-progress";
 import { MAX_PEERS } from "@contracts/wire";
 import { MAX_MEMPOOL_TXS } from "@contracts/protocol";
 import { LOCAL_TAB_MESH } from "../../network.config";
@@ -126,6 +127,9 @@ async function bootFresh(opts: BootOptions = {}): Promise<NodeHandle> {
   // is a ceiling, not a target - a started sync or an up-to-date peer
   // releases it immediately (see waitForSyncDecision).
   const BOOT_SYNC_WINDOW_MS = 6_000;
+  // BootSplash narrates every phase (the splash is up for the WHOLE boot,
+  // long before any chain gate exists) - see boot-progress.ts.
+  setBootPhase("opening node database");
   // 1. storage - real IndexedDB when possible, in-memory when the browser
   // blocks it (private mode, storage disabled). Never crash on this: a
   // memory-only node is fully functional, just forgetful.
@@ -159,7 +163,9 @@ async function bootFresh(opts: BootOptions = {}): Promise<NodeHandle> {
     }
   }
 
-  // 2. chain (genesis sealed idempotently)
+  // 2. chain (genesis sealed idempotently; boot recovery narrates its own
+  // "verifying stored chain" / "rebuilding derived state" phases from here)
+  setBootPhase("sealing genesis");
   await initChain(storage);
 
   // 2.5 boot gate: from the first hydration step until the network's first
@@ -173,6 +179,7 @@ async function bootFresh(opts: BootOptions = {}): Promise<NodeHandle> {
   let engine: P2pEngine;
   try {
     // 3. wallet custody - hydrate the hot cache from the `wallet` store
+    setBootPhase("loading your wallet");
     if (storage instanceof IdbStorage) {
       const idb = storage;
       await hydrateWallet({
@@ -228,6 +235,7 @@ async function bootFresh(opts: BootOptions = {}): Promise<NodeHandle> {
     }
 
     // 5. engine
+    setBootPhase("waking up the network");
     engine = new P2pEngine(transports, { maxReorgDepth: opts.maxReorgDepth });
     try {
       await engine.start(opts.onPeerChange);
@@ -244,10 +252,46 @@ async function bootFresh(opts: BootOptions = {}): Promise<NodeHandle> {
     // no transport came up at all (nothing can arrive).
     if (engine.hasActiveTransports()) {
       setChainGateDetail("checking for a longer chain");
+      setBootPhase("checking for a longer chain");
+      setBootWindow(BOOT_SYNC_WINDOW_MS);
       await engine.waitForSyncDecision(BOOT_SYNC_WINDOW_MS);
     }
   } finally {
+    clearBootProgress();
     bootGate();
+  }
+
+  // Wake-from-sleep survival (mobile Safari above all): iOS freezes timers
+  // and silently kills WebSockets while the page sleeps, and a bfcache
+  // restore resurrects the JS state with every socket dead but no close
+  // event delivered - the classic "NO PEERS CONNECTED forever after the
+  // phone slept". On every wake signal, the engine re-proves liveness NOW
+  // (dead sockets bounced, ladders reset, presence re-announced, catch-up
+  // sync kicked) instead of waiting out 45-120 s detector/ladder rungs.
+  // Debounced: pageshow and visibilitychange routinely fire together.
+  let removeWakeListeners: (() => void) | null = null;
+  if (typeof window !== "undefined" && typeof document !== "undefined") {
+    let lastWake = 0;
+    const wake = () => {
+      const now = Date.now();
+      if (now - lastWake < 1_000) return;
+      lastWake = now;
+      engine.revive();
+    };
+    const onPageShow = (e: Event) => {
+      if ((e as PageTransitionEvent).persisted) wake();
+    };
+    const onVisible = () => {
+      if (document.visibilityState === "visible") wake();
+    };
+    window.addEventListener("pageshow", onPageShow);
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("online", wake);
+    removeWakeListeners = () => {
+      window.removeEventListener("pageshow", onPageShow);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("online", wake);
+    };
   }
 
   return {
@@ -255,7 +299,10 @@ async function bootFresh(opts: BootOptions = {}): Promise<NodeHandle> {
     engine,
     transports,
     storageMode,
-    stop: () => engine.stop(),
+    stop: () => {
+      removeWakeListeners?.();
+      engine.stop();
+    },
     info: getInfo,
     recentBlocks: getRecentBlocks,
     recentTxs: getRecentTxs,

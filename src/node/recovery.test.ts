@@ -5,7 +5,7 @@
  * state snapshot when one exists. Real PoW, memory adapter, one continuous
  * narrative (the chain module binds one storage per process).
  */
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils.js";
 import { hashMeetsTarget } from "@contracts/protocol";
@@ -27,6 +27,7 @@ const BAKED: Record<string, { nonce: number; hash: string }> = {
   "BTWB1|1|c56c7b1e6bd77fb1cce41b3cb76d05a54c3bfd719db2942066daddf3a52352c3|6c3bb1dcd239c6cd10733a1675648f6a08deabf5483facff6767c35afda186ff|1787443201|": { nonce: 226141, hash: "0000038e6eeeb8de1aa8bbe69b548c9d6bebc03cd51874b35b46fd08541cadba" },
   "BTWB1|2|0000038e6eeeb8de1aa8bbe69b548c9d6bebc03cd51874b35b46fd08541cadba|78f93090bafefdcd1e0cd2978d13e14772fd6166158f1bb03cedcca6a409635a|1787443202|": { nonce: 4441267, hash: "00000083b48737728aa42d7c64e002f4ce8d25a1122c368f7ba514472c3176e2" },
   "BTWB1|3|00000083b48737728aa42d7c64e002f4ce8d25a1122c368f7ba514472c3176e2|327723064c8befa1726e876e536d8bd2e49d91dd1507e000f17725b0e053b0fa|1787443203|": { nonce: 3122701, hash: "0000001399de01f52337efaccef52c9804679dc1e34faaabd3b4a4889b91fe0a" },
+  "BTWB1|4|0000001399de01f52337efaccef52c9804679dc1e34faaabd3b4a4889b91fe0a|e8080f6067c383beaae0d46fb8d857675289566cdd1f9e25004c67038d1f6116|1787443204|": { nonce: 3411921, hash: "0000035e2d75f0c275e773a1d3836eb791b3bbb77c20270f0b91fff3f62b00c0" },
 };
 
 function pow(prefixAscii: string, target: string): { nonce: number; hash: string } {
@@ -162,7 +163,8 @@ describe("boot state recovery", () => {
 
   it("rebuilds from the latest snapshot even when early blocks are gone", async () => {
     // The exact row the SNAPSHOT_INTERVAL hook persists every 1,000 blocks.
-    // NOTE: destructive (block 1 is deleted) - must run LAST in this file.
+    // NOTE: destructive (block 1 is deleted) - the checkpoint tests below
+    // intentionally run on this post-disaster state.
     const tip2 = (await storage.tip())!;
     expect(tip2.height).toBe(2);
     const accountsAt2 = await storage.allAccounts();
@@ -198,4 +200,61 @@ describe("boot state recovery", () => {
     expect(afterA.balance).toBe(supplyAt2); // snapshot state survived intact
     expect((await getInfo()).totalSupply).toBe(supplyBefore);
   }, 120_000);
+
+  it("checkpoint fast path: a fully verified chain costs ZERO block reads on the next check", async () => {
+    // The rebuild above pinned the checkpoint at the tip. A healthy re-check
+    // must not touch the blocks store at all - boot stays O(1) no matter
+    // how long the chain grows. (This is the boot-time regression guard.)
+    const spy = vi.spyOn(storage, "blockAt");
+    try {
+      await recoverChainState();
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
+    const cp = JSON.parse((await storage.getMeta("recoveryCheckpoint"))!);
+    expect(cp.height).toBe((await storage.tip())!.height);
+    expect(cp.expected).toBe((await getInfo()).totalSupply);
+  });
+
+  it("incremental scan: only blocks ABOVE the checkpoint are read", async () => {
+    await mineNext(minerB.address); // block 4
+    const spy = vi.spyOn(storage, "blockAt");
+    try {
+      await recoverChainState();
+      expect(spy.mock.calls.map((c) => c[0])).toEqual([4]);
+    } finally {
+      spy.mockRestore();
+    }
+    // the checkpoint advanced to the new tip with the healed-true value
+    const cp = JSON.parse((await storage.getMeta("recoveryCheckpoint"))!);
+    expect(cp.height).toBe(4);
+    expect(cp.expected).toBe((await getInfo()).totalSupply);
+  });
+
+  it("a garbage checkpoint meta falls back to a full scan and still boots healthy", async () => {
+    // Corrupt the performance anchor itself: the node must simply pay one
+    // full scan (and stay healthy - the derived caches here are intact).
+    // Never trust the checkpoint format blindly.
+    const validCp = (await storage.getMeta("recoveryCheckpoint")) ?? null;
+    const supplyNow = (await getInfo()).totalSupply;
+    await storage.transact(async (tx) => {
+      await tx.setMeta("recoveryCheckpoint", "{definitely not json");
+    });
+    const spy = vi.spyOn(storage, "blockAt");
+    try {
+      await recoverChainState();
+      const heights = spy.mock.calls.map((c) => c[0]);
+      expect(heights).toContain(1); // full scan from genesis, not the fast path
+    } finally {
+      spy.mockRestore();
+    }
+    expect((await getInfo()).totalSupply).toBe(supplyNow); // untouched
+    // restore the fast path for any later boots of this narrative
+    if (validCp !== null) {
+      await storage.transact(async (tx) => {
+        await tx.setMeta("recoveryCheckpoint", validCp);
+      });
+    }
+  });
 });

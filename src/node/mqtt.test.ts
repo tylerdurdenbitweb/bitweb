@@ -422,3 +422,68 @@ describe("presence announces carry the chain tip (mixed-version safe)", () => {
     expect(tips.find((t) => t.id === ta.selfId)?.th).toBe(tipHash.slice(0, 12));
   });
 });
+
+describe("wake-from-sleep revival (mobile Safari)", () => {
+  it("revive() bounces the broker session NOW and the link keeps working", async () => {
+    const b = await broker();
+    let sockets = 0;
+    const countingSocket = (url: string): MqttSocketLike => {
+      sockets += 1;
+      return newSocket(url);
+    };
+    const a = collector();
+    const c = collector();
+    // periodic announces slowed to a crawl: if the mesh still heals after
+    // the bounce, it is revive's immediate re-announce doing the work
+    const ta = new MqttRelayTransport([b.url], { ...FAST, announceMs: 60_000, newSocket: countingSocket });
+    cleanup.push(() => ta.stop());
+    const tc = makeTransport([b.url]);
+    await Promise.all([ta.start(a.events), tc.start(c.events)]);
+    await until(() => a.log.some((e) => e.kind === "open") && c.log.some((e) => e.kind === "open"));
+    const before = sockets;
+
+    ta.revive(); // the wake call the boot layer makes on pageshow/visible/online
+    await until(() => sockets > before); // a fresh session connected immediately
+
+    // end-to-end: frames still flow after the bounce. The fresh session
+    // needs a beat to subscribe + mark ready (publish drops until then), so
+    // nudge on a cadence until one copy lands.
+    const cFromA = a.log.find((e) => e.kind === "open")!.id;
+    await until(() => {
+      ta.send(cFromA, "post-revive-frame");
+      return c.log.some((e) => e.kind === "msg" && e.data === "post-revive-frame");
+    });
+  });
+
+  it("MiniMqttClient.abandon() is silent (no onClose, no ladder re-arm) and reusable", async () => {
+    const b = await broker();
+    let closes = 0;
+    const client = new MiniMqttClient(
+      b.url,
+      { clientId: "abandon-1", keepAliveSec: 1, newSocket },
+      {
+        onConnect: () => {
+          void client.subscribeAll(["btwb/test/abandon"]).then(() => client.markReady());
+        },
+        onReady: () => undefined,
+        onMessage: () => undefined,
+        onClose: () => {
+          closes += 1;
+        },
+      },
+    );
+    cleanup.push(() => client.stop());
+    client.connect();
+    await until(() => client.isReady());
+
+    client.abandon();
+    await new Promise((r) => setTimeout(r, 200)); // give any close event time to fire
+    expect(closes).toBe(0); // silent: the transport reconnects on its own terms
+    expect(client.isReady()).toBe(false);
+
+    // unlike stop(), abandon leaves the client reconnectable
+    client.connect();
+    await until(() => client.isReady());
+    expect(closes).toBe(0);
+  });
+});

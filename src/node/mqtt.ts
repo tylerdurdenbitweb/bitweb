@@ -450,6 +450,22 @@ export class MiniMqttClient {
     }
     this.cleanup();
   }
+
+  /**
+   * Silent teardown WITHOUT the onClose event: the transport discards this
+   * session and connects a fresh one immediately (wake-from-sleep revival),
+   * so the reconnect ladder must not also fire for the old corpse. After a
+   * freeze the socket is usually dead anyway; closing it here is hygiene.
+   */
+  abandon(): void {
+    this.closedNotified = true; // the close event below must stay silent
+    try {
+      this.socket?.close();
+    } catch {
+      /* already gone */
+    }
+    this.cleanup();
+  }
 }
 
 // ===========================================================================
@@ -665,6 +681,31 @@ export class MqttRelayTransport implements Transport {
       b.client = this.makeClient(b.client.url, () => b);
       b.client.connect();
     }, wait);
+  }
+
+  /**
+   * Wake-from-sleep revival. A frozen-then-resumed page (iOS tab sleep,
+   * bfcache restore) holds sockets that are dead but never delivered a
+   * close event - without this, the node sits peerless until the half-open
+   * detector (45 s) and then the ladder's current rung (up to 120 s) fire.
+   * Bounce every broker session NOW: the old client is abandoned silently
+   * (no ladder re-arm), a fresh one connects immediately, and onReady
+   * re-announces our presence. Presence links are roster-based, so engine
+   * peers survive the socket bounce untouched.
+   */
+  revive(): void {
+    if (this.stopped) return;
+    for (const b of this.brokers) {
+      b.step = 0;
+      if (b.timer) {
+        clearTimeout(b.timer);
+        b.timer = null;
+      }
+      const old = b.client;
+      b.client = this.makeClient(old.url, () => b);
+      old.abandon();
+      b.client.connect();
+    }
   }
 
   private scheduleAnnounce(): void {

@@ -12,6 +12,12 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { bootNode, type NodeHandle } from "@/node/client";
 import { chainHooks } from "@/node/chain";
 import { getChainGateState, subscribeChainGate, type ChainGateState } from "@/node/chain-gate";
+import {
+  getBootProgress,
+  subscribeBootProgress,
+  type BootProgressState,
+} from "@/node/boot-progress";
+import { TerminalProgressBar } from "@/components/term/ui";
 import { notify } from "@/lib/notify";
 import { resetLocalData } from "@/lib/reset";
 import { NodeContext } from "./node-context";
@@ -26,11 +32,53 @@ const queryClient = new QueryClient();
  */
 function BootSplash() {
   const [gate, setGate] = useState<ChainGateState>(() => getChainGateState());
+  const [boot, setBoot] = useState<BootProgressState>(() => getBootProgress());
+  // local ticker: the bounded "checking for a longer chain" phase animates
+  // start->end in the splash instead of looking like a frozen wait. The clock
+  // is read in the rAF callback (never during render) and kept in state.
+  const [now, setNow] = useState<number | null>(null);
   useEffect(() => subscribeChainGate(setGate), []);
+  useEffect(() => subscribeBootProgress(setBoot), []);
+  useEffect(() => {
+    if (boot.windowStart === null || boot.windowEnd === null) return;
+    let raf = 0;
+    const tick = () => {
+      setNow(Date.now());
+      raf = requestAnimationFrame(tick);
+    };
+    tick();
+    return () => cancelAnimationFrame(raf);
+  }, [boot.windowStart, boot.windowEnd]);
+
+  // Bar numbers: measured phases report current/total directly; the bounded
+  // sync window derives them from the clock.
+  let cur = boot.current;
+  let tot = boot.total;
+  if (boot.windowStart !== null && boot.windowEnd !== null) {
+    tot = boot.windowEnd - boot.windowStart;
+    cur = now === null ? 0 : Math.min(Math.max(0, now - boot.windowStart), tot);
+  }
   return (
     <div className="flex min-h-screen items-center justify-center bg-black text-neutral-200">
-      <div className="px-6 text-center font-term text-lg">
-        SEALING GENESIS / OPENING NODE DATABASE ...<span className="blink">_</span>
+      <div className="w-full max-w-md px-6 text-center font-term text-lg">
+        <p>
+          STARTING UP<span className="blink">_</span>
+        </p>
+        <p
+          data-testid="boot-splash-phase"
+          className="mt-4 min-h-5 text-xs tracking-[0.18em] text-neutral-300"
+        >
+          {boot.phase ? boot.phase.toUpperCase() : "\u00a0"}
+        </p>
+        <TerminalProgressBar current={cur} total={tot} className="mt-3 text-sm" />
+        {cur !== null && tot !== null && boot.windowStart === null ? (
+          <p
+            data-testid="boot-splash-counts"
+            className="mt-1.5 text-[11px] tabular-nums tracking-[0.18em] text-neutral-500"
+          >
+            {cur.toLocaleString("en-US")} / {tot.toLocaleString("en-US")}
+          </p>
+        ) : null}
         {gate.active ? (
           <p
             data-testid="boot-splash-status"

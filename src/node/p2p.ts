@@ -62,7 +62,7 @@ import {
   setPopAttestationsProvider,
   setPopMinerNodeIdProvider,
 } from "./chain";
-import { beginChainUpdate, setChainGateDetail } from "./chain-gate";
+import { beginChainUpdate, setChainGateDetail, setChainGateProgress } from "./chain-gate";
 import { loadWallet, signPopAttestation } from "@/lib/bitweb";
 import {
   checkAddress,
@@ -316,6 +316,31 @@ export class P2pEngine {
   /** True when at least one transport came up (broadcast mesh or WebRTC). */
   hasActiveTransports(): boolean {
     return this.activeTransports.length > 0;
+  }
+
+  /**
+   * Wake-from-sleep revival (mobile Safari above all): iOS freezes timers
+   * and silently kills WebSockets when the tab/screen sleeps, and a bfcache
+   * restore brings the JS state back with every socket dead but no close
+   * event delivered. Left alone, the node would sit in "no peers" for up to
+   * a full reconnect-ladder rung (120 s) and then face a long catch-up
+   * sync. Called by the boot layer on pageshow(persisted) / visible / online:
+   * every transport re-proves liveness NOW (dead sockets are bounced
+   * immediately, ladders reset to their first rung), our presence and tip
+   * are re-announced, and a pending catch-up starts without waiting for the
+   * next heartbeat tick. Cheap and idempotent - safe on repeat events.
+   */
+  revive(): void {
+    if (this.stopped) return;
+    for (const t of this.activeTransports) {
+      try {
+        t.revive?.();
+      } catch (err) {
+        console.warn(`[p2p] transport "${t.kind}" revive failed:`, err);
+      }
+    }
+    this.pushAnnouncedTip();
+    if (!this.syncInFlight && this.syncQueued === null) void this.retrySyncIfBehind();
   }
 
   /**
@@ -1092,11 +1117,17 @@ export class P2pEngine {
   private async syncFromPeerInner(peerId: string): Promise<void> {
     let rollbackBudget = this.maxReorgDepth;
     bumpStat("syncsStarted");
+    // The overlay bar's target: the tip the peer advertised at handshake
+    // (or the highest block we've already seen from it). It can only grow
+    // as the peer keeps mining - the bar tracks the moving target.
+    const target = (): number =>
+      Math.max(this.peers.get(peerId)?.hello?.height ?? 0, this.bestKnown);
     // Each pass either extends our tip or rolls it back (bounded) - so it
     // always converges to the peer's chain if that chain is valid.
     for (;;) {
       const tip = await getTipSummary();
       setChainGateDetail(`block #${tip.height.toLocaleString("en-US")}`);
+      if (target() > tip.height) setChainGateProgress(tip.height, target());
       const batch = await this.requestBlocks(peerId, tip.height + 1, P2P_BLOCK_BATCH);
       if (batch.length === 0) return; // caught up (or peer went quiet)
       let restart = false;
@@ -1104,6 +1135,7 @@ export class P2pEngine {
         try {
           await applyWireBlock(wb);
           if (wb.height > this.bestKnown) this.bestKnown = wb.height;
+          if (target() > wb.height) setChainGateProgress(wb.height, target());
           continue;
         } catch (err) {
           if (!(err instanceof ChainValidationError)) throw err;
@@ -1172,6 +1204,7 @@ export class P2pEngine {
       setChainGateDetail(
         `deep fork repair: fetching block #${blocks[blocks.length - 1].height.toLocaleString("en-US")}`,
       );
+      setChainGateProgress(blocks[blocks.length - 1].height, advertised);
       if (chunk.length < P2P_BLOCK_BATCH) break;
     }
     // Must start at OUR genesis and beat our tip, even truncated: a partial

@@ -84,6 +84,49 @@ export function CopyBtn({ text, label = "COPY" }: { text: string; label?: string
   );
 }
 
+/* -- Terminal progress bar --------------------------------------------------
+ * Text-glyph bar in the phosphor idiom: determinate when the operation can
+ * measure itself (blocks verified/applied/fetched), a pulsing frame when it
+ * cannot - a wait must never look frozen. Pure-ASCII glyphs (#/-) so the bar
+ * renders in the surrounding terminal font on every platform.
+ */
+export function TerminalProgressBar({
+  current,
+  total,
+  className,
+}: {
+  /** determinate numbers; pass null/null for the indeterminate pulse */
+  current: number | null;
+  total: number | null;
+  className?: string;
+}) {
+  const WIDTH = 26;
+  const determinate =
+    current !== null && total !== null && Number.isFinite(current) && Number.isFinite(total) && total > 0;
+  const ratio = determinate ? Math.min(1, Math.max(0, current / total)) : 0;
+  const filled = Math.round(ratio * WIDTH);
+  const pct = determinate ? Math.floor(ratio * 100) : null;
+  return (
+    <div
+      data-testid="terminal-progress-bar"
+      data-determinate={determinate || undefined}
+      className={cn(
+        "ascii select-none whitespace-nowrap text-center text-neutral-200",
+        !determinate && "blink",
+        className,
+      )}
+      role="progressbar"
+      aria-valuemin={0}
+      aria-valuemax={determinate ? 100 : undefined}
+      aria-valuenow={pct ?? undefined}
+    >
+      [{"#".repeat(filled)}
+      {"-".repeat(WIDTH - filled)}]
+      {pct !== null ? <span className="tabular-nums"> {pct}%</span> : null}
+    </div>
+  );
+}
+
 /* -- Status line ---------------------------------------------------------- */
 export function StatusLine({ ok, children }: { ok: boolean; children: ReactNode }) {
   return (
@@ -238,7 +281,7 @@ export function SupplyLogo({
       {/* terminal-styled tooltip: hover AND keyboard focus */}
       <div
         role="tooltip"
-        className="pointer-events-none absolute bottom-full left-1/2 z-50 mb-1 -translate-x-1/2 whitespace-nowrap border border-neutral-600 bg-black px-3 py-1.5 text-[clamp(11px,3.2vw,14px)] font-semibold tracking-[0.15em] text-white opacity-0 transition-opacity [text-shadow:0_0_6px_rgba(255,255,255,0.45)] group-hover:opacity-100 group-focus-within:opacity-100"
+        className="pointer-events-none absolute bottom-full left-1/2 z-50 -mb-1 -translate-x-1/2 whitespace-nowrap border border-neutral-600 bg-black px-3 py-1.5 text-[clamp(11px,3.2vw,14px)] font-semibold tracking-[0.15em] text-white opacity-0 transition-opacity [text-shadow:0_0_6px_rgba(255,255,255,0.45)] group-hover:opacity-100 group-focus-within:opacity-100"
       >
         {tip}
       </div>

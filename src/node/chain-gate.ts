@@ -19,6 +19,11 @@
  * per-block apply path during bulk syncs, so no promises, no timers.
  */
 
+export interface ChainGateProgress {
+  current: number;
+  total: number;
+}
+
 export interface ChainGateState {
   /** Number of nested operations currently holding the gate. */
   depth: number;
@@ -27,6 +32,8 @@ export interface ChainGateState {
   reason: string | null;
   /** Optional live progress line ("312/1500 blocks", "block #1240"). */
   detail: string | null;
+  /** Optional structured progress for a determinate bar (null: indeterminate). */
+  progress: ChainGateProgress | null;
   /** When the current burst started (ms epoch), null while inactive. */
   startedAt: number | null;
 }
@@ -36,11 +43,12 @@ type Listener = (state: ChainGateState) => void;
 let depth = 0;
 let reason: string | null = null;
 let detail: string | null = null;
+let progress: ChainGateProgress | null = null;
 let startedAt: number | null = null;
 const listeners = new Set<Listener>();
 
 function snapshot(): ChainGateState {
-  return { depth, active: depth > 0, reason, detail, startedAt };
+  return { depth, active: depth > 0, reason, detail, progress, startedAt };
 }
 
 function emit(): void {
@@ -58,6 +66,7 @@ export function beginChainUpdate(why: string): () => void {
   if (depth === 1) {
     reason = why;
     detail = null;
+    progress = null;
     startedAt = Date.now();
   }
   emit();
@@ -69,6 +78,7 @@ export function beginChainUpdate(why: string): () => void {
     if (depth === 0) {
       reason = null;
       detail = null;
+      progress = null;
       startedAt = null;
     }
     emit();
@@ -79,6 +89,26 @@ export function beginChainUpdate(why: string): () => void {
 export function setChainGateDetail(text: string | null): void {
   if (depth === 0) return; // progress without an operation is noise
   detail = text;
+  emit();
+}
+
+/**
+ * Structured progress for a determinate bar: current/total in the same unit
+ * (blocks applied, blocks fetched, ...). Pass null to go back to the
+ * indeterminate bar. Cleared automatically when the burst ends, like detail.
+ */
+export function setChainGateProgress(current: number, total: number): void {
+  if (depth === 0) return;
+  progress =
+    Number.isFinite(current) && Number.isFinite(total) && total > 0
+      ? { current: Math.max(0, Math.min(current, total)), total }
+      : null;
+  emit();
+}
+
+export function clearChainGateProgress(): void {
+  if (depth === 0 || progress === null) return;
+  progress = null;
   emit();
 }
 
@@ -107,6 +137,7 @@ export function resetChainGate(): void {
   depth = 0;
   reason = null;
   detail = null;
+  progress = null;
   startedAt = null;
   emit();
 }

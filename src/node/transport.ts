@@ -67,6 +67,14 @@ export interface Transport {
    * channel never implement it.
    */
   setAnnouncedTip?(tip: { height: number; hash: string }): void;
+  /**
+   * Optional: wake-from-sleep revival. Mobile browsers (Safari above all)
+   * freeze timers and silently kill sockets while the page sleeps; on wake,
+   * the engine calls this so the transport re-proves liveness NOW instead of
+   * waiting out a long reconnect-ladder rung. Transports with no socket to
+   * lose (same-browser mesh) simply don't implement it.
+   */
+  revive?(): void;
 }
 
 export function randomPeerId(prefix: string): string {
@@ -598,6 +606,24 @@ export class PeerJsTransport implements Transport {
         /* the next tick (or the reclaim ladder) catches a stuck socket */
       }
     }
+  }
+
+  /**
+   * Wake-from-sleep revival: the watchdog's cadence pauses while the page is
+   * frozen, so on wake we cannot afford to wait for the next tick - or,
+   * worse, for a reclaim ladder rung that grew to minutes while asleep.
+   * Run the check immediately and re-mesh; a pending long reclaim fires now.
+   */
+  revive(): void {
+    if (this.stopped) return;
+    if (this.reclaimTimer) {
+      clearTimeout(this.reclaimTimer);
+      this.reclaimTimer = null;
+      void this.fullReclaim();
+      return;
+    }
+    this.watchdogTick();
+    this.redialLobby();
   }
 
   private scheduleReclaim(): void {

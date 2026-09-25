@@ -251,6 +251,34 @@ export class WsRelayTransport implements Transport {
     }
   }
 
+  /**
+   * Wake-from-sleep revival: a frozen-then-resumed page can hold a dead
+   * socket that never delivered its close event (or a reconnect timer
+   * parked on a long ladder rung). Re-prove liveness NOW: a pending timer
+   * is replaced by an immediate connect, and a seemingly-open socket is
+   * bounced onto the ladder's first rung - the close handler does the rest.
+   */
+  revive(): void {
+    if (this.stopped) return;
+    this.reconnectStep = 0;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+      this.connect();
+      return;
+    }
+    const ws = this.socket;
+    if (ws) {
+      try {
+        ws.close();
+      } catch {
+        /* already gone - the ladder is armed either way */
+      }
+    } else {
+      this.connect();
+    }
+  }
+
   /** Roster add: surface as an engine link while under the link cap. */
   private learn(id: string): void {
     let entry = this.roster.get(id);

@@ -8,6 +8,13 @@
     <link rel="icon" type="image/png" sizes="16x16" href="./favicon-16.png" />
     <link rel="apple-touch-icon" sizes="180x180" href="./apple-touch-icon.png" />
     <link rel="manifest" href="./manifest.webmanifest" />
+    <!-- Kill the fallback-font flash: the terminal's two workhorse faces are
+         fetched with top priority, before the CSS even parses, so first
+         paint already renders in VT323 / IBM Plex Mono. (crossorigin is
+         required on font preloads even same-origin - fonts load in CORS
+         mode, and the request must match the CSS fetch.) -->
+    <link rel="preload" href="/fonts/vt323-400.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="preload" href="/fonts/plex-mono-400.woff2" as="font" type="font/woff2" crossorigin />
     <meta name="theme-color" content="#000000" />
     <!-- iOS installability: Safari ignores the manifest, these are its hooks -->
     <meta name="apple-mobile-web-app-capable" content="yes" />

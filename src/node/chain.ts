@@ -64,7 +64,13 @@ import type {
   PopTransfer,
   TxRow,
 } from "./storage";
-import { beginChainUpdate, resetChainGate, setChainGateDetail } from "./chain-gate";
+import {
+  beginChainUpdate,
+  resetChainGate,
+  setChainGateDetail,
+  setChainGateProgress,
+} from "./chain-gate";
+import { setBootPhase, setBootProgress } from "./boot-progress";
 
 /** Consensus/state validation failure - the peer that caused it earns a strike. */
 export class ChainValidationError extends Error {}
@@ -258,6 +264,66 @@ async function bootstrapGenesis(): Promise<void> {
  * blocks are gone (pruned/evicted), the latest state snapshot above the gap
  * is the only remaining anchor and is used as the base instead.
  */
+/**
+ * Verified-supply checkpoint (meta key `recoveryCheckpoint`, JSON
+ * `{height, expected}`): written after every healthy boot check and every
+ * rebuild, it pins the block-implied supply `sum(reward + pop - fees)`
+ * through `height`. Block rows are append-only and were verified when the
+ * checkpoint was written, so later boots only scan the rows ABOVE it -
+ * boot stays O(new blocks) instead of O(all blocks) as the chain grows.
+ * It is a performance anchor only, never a trust shortcut: the balances
+ * invariant is always checked in full, drift above the checkpoint is
+ * still caught (the cached value disagrees with the corrupted caches),
+ * and any rebuild still re-derives everything from the blocks store or a
+ * state snapshot exactly as before. A missing/garbage row just costs one
+ * full scan.
+ */
+const RECOVERY_CHECKPOINT_KEY = "recoveryCheckpoint";
+/** Block rows are read in parallel chunks: sequential one-row IDB reads
+ *  dominated boot time on grown chains. */
+const RECOVERY_READ_CHUNK = 64;
+
+interface RecoveryCheckpoint {
+  height: number;
+  expected: number;
+}
+
+function parseRecoveryCheckpoint(raw: string | undefined, tipHeight: number): RecoveryCheckpoint | null {
+  if (raw === undefined) return null;
+  try {
+    const v = JSON.parse(raw) as Partial<RecoveryCheckpoint>;
+    if (
+      Number.isInteger(v.height) &&
+      v.height! >= 0 &&
+      v.height! <= tipHeight &&
+      Number.isFinite(v.expected) &&
+      v.expected! >= 0
+    ) {
+      return { height: v.height!, expected: v.expected! };
+    }
+  } catch {
+    /* garbage row - fall through to the full scan */
+  }
+  return null;
+}
+
+/** Read block rows [from, to] in parallel chunks; undefined where missing. */
+async function readBlockRows(
+  s: ChainStorage,
+  from: number,
+  to: number,
+): Promise<Array<BlockRow | undefined>> {
+  const out: Array<BlockRow | undefined> = new Array(to - from + 1);
+  for (let base = from; base <= to; base += RECOVERY_READ_CHUNK) {
+    const end = Math.min(base + RECOVERY_READ_CHUNK - 1, to);
+    const rows = await Promise.all(
+      Array.from({ length: end - base + 1 }, (_, i) => s.blockAt(base + i)),
+    );
+    for (let i = 0; i < rows.length; i++) out[base - from + i] = rows[i];
+  }
+  return out;
+}
+
 async function recoverChainStateIfNeeded(s: ChainStorage): Promise<void> {
   const blocks = await s.blockCount();
   if (blocks <= 1) return; // genesis-only chain has no derived state to lose
@@ -273,24 +339,52 @@ async function recoverChainStateIfNeeded(s: ChainStorage): Promise<void> {
   // are a cache of the same ledger. Recompute the block-implied supply and
   // demand BOTH caches agree with it. Any drift - from any version, any
   // cause - heals here on boot, deterministically, identically on every
-  // device that holds the same chain.
-  let expected: number | null = 0;
-  for (let h = 1; h <= tip.height; h++) {
-    const b = await s.blockAt(h);
-    if (!b) {
-      expected = null;
-      break;
+  // device that holds the same chain. The checkpoint lets a verified chain
+  // skip re-reading rows an earlier boot already proved.
+  const checkpoint = parseRecoveryCheckpoint(await s.getMeta(RECOVERY_CHECKPOINT_KEY), tip.height);
+  const scanFrom = checkpoint ? checkpoint.height + 1 : 1;
+  let expected: number | null = checkpoint ? checkpoint.expected : 0;
+  if (scanFrom <= tip.height) {
+    setBootPhase("verifying stored chain");
+    setBootProgress(scanFrom - 1, tip.height);
+    const rows = await readBlockRows(s, scanFrom, tip.height);
+    for (let i = 0; i < rows.length; i++) {
+      const b = rows[i];
+      if (!b) {
+        expected = null;
+        break;
+      }
+      expected! += b.reward + b.popTransfers.reduce((sum, pt) => sum + pt.amount, 0) - b.feesBurned;
+      if (i % RECOVERY_READ_CHUNK === RECOVERY_READ_CHUNK - 1) {
+        setBootProgress(scanFrom + i, tip.height);
+      }
     }
-    expected += b.reward + b.popTransfers.reduce((sum, pt) => sum + pt.amount, 0) - b.feesBurned;
+    setBootProgress(tip.height, tip.height);
   }
-  if (held === supply && (expected === null || expected === supply)) return; // healthy boot
+  if (held === supply && (expected === null || expected === supply)) {
+    // healthy boot - pin how far the blocks store was proven, so the next
+    // boot only pays for what arrived since
+    if (expected !== null) {
+      await s.transact(async (tx) => {
+        await tx.setMeta(
+          RECOVERY_CHECKPOINT_KEY,
+          JSON.stringify({ height: tip.height, expected } satisfies RecoveryCheckpoint),
+        );
+      });
+    }
+    return;
+  }
 
-  // When the blocks row scan is complete it is ground truth: replay from
-  // genesis and IGNORE state snapshots - a snapshot written by the same
+  // Rebuild anchor probe - deliberately independent of the checkpointed
+  // check above: replay from genesis needs COMPLETE row history, and only
+  // this probe can say whether we have it. A complete history means replay
+  // from genesis and IGNORE state snapshots - a snapshot written by the same
   // path that drifted would re-import the drift. When early history is
   // unavailable (pruned away or evicted), the latest snapshot ABOVE the gap
-  // is the only remaining anchor: heal from it instead.
-  const snap = expected === null ? ((await s.latestSnapshot()) ?? null) : null;
+  // is the only remaining anchor: heal from it instead. (Runs only on the
+  // disaster path - a healthy boot never pays for it.)
+  const probe = await readBlockRows(s, 1, tip.height);
+  const snap = probe.some((r) => !r) ? ((await s.latestSnapshot()) ?? null) : null;
   const replayFrom = snap ? snap.height + 1 : 1;
   if (snap && snap.height >= tip.height) return; // nothing replayable above it
   console.warn(
@@ -307,34 +401,44 @@ async function recoverChainStateIfNeeded(s: ChainStorage): Promise<void> {
     included: MempoolTxRow[];
     coinbaseTxid: string;
   }
+  setBootPhase("rebuilding derived state");
+  setBootProgress(0, tip.height - replayFrom + 1);
   const rows: ReplayRow[] = [];
-  for (let h = replayFrom; h <= tip.height; h++) {
-    const b = await s.blockAt(h);
-    if (!b) {
-      throw new Error(`chain corrupted: block ${h} is missing - cannot rebuild state`);
+  for (let base = replayFrom; base <= tip.height; base += RECOVERY_READ_CHUNK) {
+    const end = Math.min(base + RECOVERY_READ_CHUNK - 1, tip.height);
+    const chunkBlocks = await readBlockRows(s, base, end);
+    const chunkTxs = await Promise.all(
+      Array.from({ length: end - base + 1 }, (_, i) => s.txsInBlock(base + i)),
+    );
+    for (let i = 0; i < chunkBlocks.length; i++) {
+      const b = chunkBlocks[i];
+      if (!b) {
+        throw new Error(`chain corrupted: block ${base + i} is missing - cannot rebuild state`);
+      }
+      const txs = chunkTxs[i];
+      const cb = txs.find((t) => t.type === "coinbase");
+      if (!cb) throw new Error(`chain corrupted: block ${b.height} has no coinbase row`);
+      rows.push({
+        block: b,
+        coinbaseTxid: cb.txid,
+        included: txs
+          .filter((t) => t.type === "transfer")
+          .map((t) => ({
+            txid: t.txid,
+            type: "transfer",
+            fromAddress: t.fromAddress as string,
+            toAddress: t.toAddress,
+            amount: t.amount,
+            fee: t.fee,
+            nonce: t.nonce as number,
+            pubkey: t.pubkey as string,
+            signature: t.signature as string,
+            timestamp: t.timestamp,
+            createdAt: 0, // admission order is irrelevant at apply time
+          })),
+      });
     }
-    const txs = await s.txsInBlock(h);
-    const cb = txs.find((t) => t.type === "coinbase");
-    if (!cb) throw new Error(`chain corrupted: block ${h} has no coinbase row`);
-    rows.push({
-      block: b,
-      coinbaseTxid: cb.txid,
-      included: txs
-        .filter((t) => t.type === "transfer")
-        .map((t) => ({
-          txid: t.txid,
-          type: "transfer",
-          fromAddress: t.fromAddress as string,
-          toAddress: t.toAddress,
-          amount: t.amount,
-          fee: t.fee,
-          nonce: t.nonce as number,
-          pubkey: t.pubkey as string,
-          signature: t.signature as string,
-          timestamp: t.timestamp,
-          createdAt: 0, // admission order is irrelevant at apply time
-        })),
-    });
+    setBootProgress(rows.length, tip.height - replayFrom + 1);
   }
 
   await s.transact(async (tx) => {
@@ -376,6 +480,15 @@ async function recoverChainStateIfNeeded(s: ChainStorage): Promise<void> {
     }
   });
   invalidateInfoCache();
+  // The rebuild re-derived everything from trusted anchors - pin it, so the
+  // next boot verifies only what arrives from now on.
+  const healed = Number((await s.getMeta("totalSupply")) ?? "0");
+  await s.transact(async (tx) => {
+    await tx.setMeta(
+      RECOVERY_CHECKPOINT_KEY,
+      JSON.stringify({ height: tip.height, expected: healed } satisfies RecoveryCheckpoint),
+    );
+  });
   console.info(
     `[bitweb] state rebuild complete: ${rows.length} block(s) replayed` +
       (snap ? ` on top of snapshot #${snap.height}` : " from genesis"),
@@ -2163,6 +2276,7 @@ export async function importChain(data: unknown, opts?: ImportOptions): Promise<
             // overlay in one event per block on huge files
             if (i % 32 === 0 || i === total) {
               setChainGateDetail(`applying block ${i}/${total}`);
+              setChainGateProgress(i, total);
             }
           }
         } catch (err) {
@@ -2223,6 +2337,7 @@ export function adoptRemoteChain(blocks: WireBlock[]): Promise<number> {
         // 32-block cadence: progress stays live without one event per block
         if (i % 32 === 0 || i === total) {
           setChainGateDetail(`applying block ${i}/${total}`);
+          setChainGateProgress(i, total);
         }
       }
     } catch (err) {

@@ -12,6 +12,7 @@ import { useStorageWarning } from "@/hooks/useStorageWarning";
 import { useWallet } from "@/hooks/useWallet";
 import { NotificationBell } from "@/components/term/NotificationBell";
 import { InstallApp } from "@/components/term/InstallApp";
+import { TerminalProgressBar } from "@/components/term/ui";
 import { fmtCompact } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
@@ -125,6 +126,23 @@ function ChainUpdateOverlay() {
             className="mt-1.5 text-center text-[11px] tabular-nums tracking-[0.18em] text-neutral-400"
           >
             {state.detail}
+          </p>
+        ) : null}
+        {/* the wait must never look frozen: a determinate bar when the
+            operation measures itself (sync/import blocks), a pulsing frame
+            when it cannot */}
+        <TerminalProgressBar
+          current={state.progress?.current ?? null}
+          total={state.progress?.total ?? null}
+          className="mt-4 text-sm"
+        />
+        {state.progress ? (
+          <p
+            data-testid="chain-update-counts"
+            className="mt-1.5 text-center text-[11px] tabular-nums tracking-[0.18em] text-neutral-500"
+          >
+            {state.progress.current.toLocaleString("en-US")} /{" "}
+            {state.progress.total.toLocaleString("en-US")}
           </p>
         ) : null}
         <div className="mt-5 border-t border-neutral-800 pt-3 text-center text-[10px] leading-relaxed tracking-[0.14em] text-neutral-500">

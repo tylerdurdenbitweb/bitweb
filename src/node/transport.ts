@@ -460,6 +460,17 @@ export class PeerJsTransport implements Transport {
   readonly selfId: string; // set after the lobby slot is claimed
   private peer: PeerJsLike | null = null;
   private conns = new Map<string, PeerJsConn>();
+  /**
+   * Consecutive revive() calls that found PeerJS claiming "connected" with
+   * no mesh activity to back it up. PeerJS only sets `disconnected` when IT
+   * notices the signaling socket died - on iOS that notice can simply never
+   * arrive (the OS killed the TCP stream while the page slept, and no close
+   * event is ever delivered). Two strikes and we stop trusting the socket:
+   * fullReclaim() tears the registration down and claims a fresh one.
+   * Any real activity (link opens, data arrives, socket re-opens) resets
+   * the counter, so a healthy mesh never pays the reclaim cost.
+   */
+  private softRevives = 0;
   private events: TransportEvents | null = null;
   private slotPrefix: string;
   private peerCtor: PeerCtor | null;
@@ -622,6 +633,18 @@ export class PeerJsTransport implements Transport {
       void this.fullReclaim();
       return;
     }
+    const peer = this.peer;
+    if (peer && !peer.destroyed && !peer.disconnected) {
+      // The engine only revives us when every link is gone or the page
+      // slept - if PeerJS swears the socket is fine for the SECOND
+      // consecutive time, it is blind to a silently-dead iOS socket.
+      this.softRevives += 1;
+      if (this.softRevives >= 2) {
+        this.softRevives = 0;
+        void this.fullReclaim();
+        return;
+      }
+    }
     this.watchdogTick();
     this.redialLobby();
   }
@@ -713,6 +736,7 @@ export class PeerJsTransport implements Transport {
     // instead of waiting for the next 60s redial cycle. (Only for the
     // seated registration - a claim-time open is meshed by onClaimed.)
     peer.on("open", () => {
+      this.softRevives = 0; // the signaling socket just proved itself
       if (this.seatedPeer === peer) this.redialLobby();
     });
     peer.on("disconnected", () => {
@@ -748,6 +772,9 @@ export class PeerJsTransport implements Transport {
   private wireConn(conn: PeerJsConn, dir: "in" | "out"): void {
     const id = conn.peer;
     conn.on("open", () => {
+      // a fresh DataChannel could only be brokered through a LIVE signaling
+      // socket - the revive-escalation counter resets on this proof too
+      this.softRevives = 0;
       const old = this.conns.get(id);
       if (old && old !== conn && old.open) {
         const keepDir = this.selfId < id ? "out" : "in";
@@ -771,6 +798,9 @@ export class PeerJsTransport implements Transport {
       this.events?.onOpen(id);
     });
     conn.on("data", (data) => {
+      // Real bytes over the mesh: the signaling path that built this conn
+      // was alive moments ago, so the revive-escalation counter resets.
+      this.softRevives = 0;
       if (typeof data === "string") this.events?.onMessage(id, data);
     });
     const drop = () => {

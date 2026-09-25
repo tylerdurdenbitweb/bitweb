@@ -205,7 +205,12 @@ export class WsRelayTransport implements Transport {
     });
     ws.on("close", () => {
       clearTimeout(openTimer);
-      if (this.socket === ws) this.socket = null;
+      // A socket abandoned by revive() must stay silent: on iOS its close
+      // event can arrive minutes late, and without this guard that late
+      // event would tear down the FRESH connection's links and re-arm the
+      // ladder behind its back.
+      if (this.socket !== ws) return;
+      this.socket = null;
       if (this.stopped) return;
       this.dropAllLinks();
       this.connected = false;
@@ -256,7 +261,10 @@ export class WsRelayTransport implements Transport {
    * socket that never delivered its close event (or a reconnect timer
    * parked on a long ladder rung). Re-prove liveness NOW: a pending timer
    * is replaced by an immediate connect, and a seemingly-open socket is
-   * bounced onto the ladder's first rung - the close handler does the rest.
+   * abandoned silently - NOT awaited. The old code closed the socket and
+   * let the close handler re-arm the ladder, but a silently-dead iOS socket
+   * may never fire that event, parking the relay for minutes; the fresh
+   * connect below starts immediately and the stale close stays mute.
    */
   revive(): void {
     if (this.stopped) return;
@@ -264,19 +272,19 @@ export class WsRelayTransport implements Transport {
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
-      this.connect();
-      return;
     }
     const ws = this.socket;
     if (ws) {
+      this.socket = null; // the late close event now takes the silent path
       try {
         ws.close();
       } catch {
-        /* already gone - the ladder is armed either way */
+        /* already gone */
       }
-    } else {
-      this.connect();
+      this.dropAllLinks();
+      this.connected = false;
     }
+    this.connect();
   }
 
   /** Roster add: surface as an engine link while under the link cap. */

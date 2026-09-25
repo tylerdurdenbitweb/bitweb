@@ -597,6 +597,54 @@ describe("PeerJsTransport - registration self-healing", () => {
     }
   });
 
+  it("a socket PeerJS never flags as dead is force-reclaimed on the SECOND revive", async () => {
+    const ev = events();
+    const t = new PeerJsTransport("pfx", makeHealCtor(), { watchdogMs: 40 });
+    await t.start(ev.handlers);
+    try {
+      const first = HealPeer.created[0];
+      expect(first.disconnected).toBe(false); // PeerJS is blind (iOS case)
+      t.revive(); // first strike: soft probe only
+      await new Promise((r) => setTimeout(r, 30));
+      expect(HealPeer.created).toHaveLength(1); // no reclaim yet
+      expect(first.destroyed).toBe(false);
+      t.revive(); // second strike: stop trusting the blind socket
+      for (let i = 0; i < 60 && HealPeer.created.length < 2; i++) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      expect(HealPeer.created.length).toBeGreaterThanOrEqual(2);
+      expect(first.destroyed).toBe(true); // torn down and re-claimed
+      expect(t.selfId).toMatch(/^pfx-slot-\d+$/);
+    } finally {
+      t.stop();
+    }
+  });
+
+  it("mesh activity resets the revive escalation - a healthy socket is never reclaimed", async () => {
+    const ev = events();
+    const t = new PeerJsTransport("pfx", makeHealCtor(), { watchdogMs: 40 });
+    await t.start(ev.handlers);
+    try {
+      const first = HealPeer.created[0];
+      t.dial("zzz-peer");
+      const conn = first.conns.find((c) => c.peer === "zzz-peer")!;
+      t.revive(); // strike one
+      await new Promise((r) => setTimeout(r, 30));
+      conn.fireOpen(); // link opens -> proof of life, counter resets
+      t.revive(); // strike one again (was reset)
+      await new Promise((r) => setTimeout(r, 30));
+      expect(HealPeer.created).toHaveLength(1); // still no reclaim
+      t.revive(); // genuine strike two now
+      for (let i = 0; i < 60 && HealPeer.created.length < 2; i++) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      expect(HealPeer.created.length).toBeGreaterThanOrEqual(2);
+      expect(first.destroyed).toBe(true);
+    } finally {
+      t.stop();
+    }
+  });
+
   it("stop() during a cold reclaim leaves nothing armed behind", async () => {
     const ev = events();
     // every probe is "down" via a HealPeer variant that never opens

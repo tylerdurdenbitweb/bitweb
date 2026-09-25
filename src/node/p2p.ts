@@ -1219,7 +1219,17 @@ export class P2pEngine {
       const batch = await this.requestBlocks(peerId, tip.height + 1, P2P_BLOCK_BATCH);
       if (batch.length === 0) return; // caught up (or peer went quiet)
       let restart = false;
+      // Catch-up on a phone must never starve the compositor: the per-block
+      // awaits are only microtask-level breathers, so every few blocks we
+      // hand the event loop a full macrotask - paint and input slots stay
+      // open even during a 2,000-block catch-up (the classic "site freezes
+      // while syncing" complaint on iOS).
+      let sinceYield = 0;
       for (const wb of batch) {
+        if (++sinceYield >= 8) {
+          sinceYield = 0;
+          await new Promise((r) => setTimeout(r, 0));
+        }
         try {
           await applyWireBlock(wb);
           if (wb.height > this.bestKnown) this.bestKnown = wb.height;

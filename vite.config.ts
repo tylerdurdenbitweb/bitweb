@@ -9,6 +9,14 @@ import { defineConfig } from "vite";
 export default defineConfig(({ command }) => ({
   base: "./",
   plugins: [react()],
+  // Build stamp baked into the bundle and shown in the footer ("BUILD ..."):
+  // after every deploy the user can verify which release their phone ACTUALLY
+  // runs - a stale tab or a skipped upload is visible at a glance.
+  define: {
+    __BITWEB_BUILD__: JSON.stringify(
+      new Date().toISOString().slice(0, 16).replace(/[-:]/g, "").replace("T", "-"),
+    ),
+  },
   // dev pre-bundle cache: node_modules is not writable on every mount
   cacheDir: ".vite",
   // Dev serves public/ directly; build copies it via scripts/copy-public.mjs

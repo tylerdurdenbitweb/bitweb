@@ -234,6 +234,38 @@ describe("WsRelayTransport - resilience", () => {
     }
   });
 
+  it("revive bounces the socket instantly and the stale close event stays silent", async () => {
+    // The iOS bug this guards: a frozen-then-resumed page holds a dead
+    // socket whose close event may arrive minutes late (or never). revive()
+    // must reconnect NOW, and when the old socket's close finally lands it
+    // must NOT tear down the fresh connection's links or re-arm the ladder.
+    const a = collector();
+    const b = collector();
+    const ta = makeTransport("t-room-revive");
+    const tb = makeTransport("t-room-revive");
+    await Promise.all([ta.start(a.events), tb.start(b.events)]);
+    try {
+      await until(() => ta.links().length === 1 && tb.links().length === 1);
+      const peerForA = ta.links()[0];
+      (ta as Transport & { revive(): void }).revive();
+      // the bounce is immediate: links dropped synchronously, no ladder wait
+      expect(ta.links()).toEqual([]);
+      // the mesh re-heals on the fresh socket, same ids
+      await until(() => ta.links().includes(peerForA) && tb.links().length === 1);
+      // give the OLD socket's late close plenty of time to arrive
+      await new Promise((r) => setTimeout(r, 400));
+      // the fresh link survived the stale close...
+      expect(ta.links()).toEqual([peerForA]);
+      // ...and the engine heard exactly ONE close for the peer (the
+      // revive-time drop) - not a second one from the zombie socket
+      const closes = a.log.filter((e) => e.kind === "close" && e.id === peerForA);
+      expect(closes).toHaveLength(1);
+    } finally {
+      ta.stop();
+      tb.stop();
+    }
+  });
+
   it("stop() leaves nothing armed: no reconnect, no frames, no throws", async () => {
     const a = collector();
     const ta = makeTransport("t-room-8");

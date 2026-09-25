@@ -61,6 +61,7 @@ window.addEventListener("load", () => {
 
 // HashRouter: this build deploys as pure static files (GitHub Pages /
 // Netlify / any web root) - there is no server to rewrite deep links.
+console.info(`[boot] bitweb build ${__BITWEB_BUILD__}`);
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <HashRouter>

@@ -20,8 +20,8 @@ const NAV = [
   { key: "1", to: "/", label: "TERMINAL" },
   { key: "2", to: "/wallet", label: "WALLET" },
   { key: "3", to: "/transfers", label: "TRANSFERS" },
-  { key: "4", to: "/manifesto", label: "MANIFESTO" },
-  { key: "5", to: "/dashboard", label: "DASHBOARD" },
+  { key: "4", to: "/dashboard", label: "DASHBOARD" },
+  { key: "5", to: "/manifesto", label: "MANIFESTO" },
 ];
 
 /* -- boot sequence -------------------------------------------------------- */
@@ -365,6 +365,10 @@ export function Layout({ children }: { children: ReactNode }) {
           </span>
           <span className="hidden sm:inline">-</span>
           <span>MEMPOOL {info.data ? `${info.data.mempoolSize} TX` : "-"}</span>
+          <span className="hidden sm:inline">-</span>
+          <span title="build stamp - check this after every deploy to know which release this tab runs">
+            BUILD {__BITWEB_BUILD__}
+          </span>
           <span className="hidden md:inline">-</span>
           <span className="hidden md:inline">NO COOKIES - NO TRACKERS - NO STORED IPS</span>
           <InstallApp />

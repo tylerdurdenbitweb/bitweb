@@ -53,14 +53,22 @@ self.addEventListener("fetch", (event) => {
   const url = new URL(req.url);
   if (url.origin !== self.location.origin) return; // signaling / peers pass through
 
-  // Navigations: network-first, cached shell as the offline fallback.
+  // Navigations: network-first, cached shell as the fallback. Only a HEALTHY
+  // shell may replace the cached one: during a GitHub Pages deploy the site
+  // can briefly answer its default 404 page, and caching that as the shell
+  // would show a 404 on every later launch (the "iOS shows a 404" bug) -
+  // even after the deploy finished. A non-200 answer falls back to the last
+  // good shell exactly like an offline fetch does.
   if (req.mode === "navigate") {
     event.respondWith(
       fetch(req)
         .then((res) => {
-          const copy = res.clone();
-          caches.open(CACHE_VERSION).then((cache) => cache.put("./index.html", copy));
-          return res;
+          if (res.ok) {
+            const copy = res.clone();
+            caches.open(CACHE_VERSION).then((cache) => cache.put("./index.html", copy));
+            return res;
+          }
+          return caches.match("./index.html").then((hit) => hit || res);
         })
         .catch(() => caches.match("./index.html")),
     );

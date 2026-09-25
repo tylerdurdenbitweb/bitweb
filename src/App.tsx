@@ -7,6 +7,7 @@ import Terminal from "./pages/Terminal";
 // Secondary pages load on demand - the landing Terminal stays eager so
 // first paint never waits on a chunk (and the QR vendor code only downloads
 // when a page that renders codes is actually visited).
+const Dashboard = lazy(() => import("./pages/Dashboard"));
 const Wallet = lazy(() => import("./pages/Wallet"));
 const Transfers = lazy(() => import("./pages/Transfers"));
 const Manifesto = lazy(() => import("./pages/Manifesto"));
@@ -48,6 +49,14 @@ export default function App() {
       <ErrorBoundary>
         <Routes>
           <Route path="/" element={<Terminal />} />
+          <Route
+            path="/dashboard"
+            element={
+              <Suspense fallback={<PageLoader />}>
+                <Dashboard />
+              </Suspense>
+            }
+          />
           <Route
             path="/wallet"
             element={

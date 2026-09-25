@@ -21,6 +21,7 @@ const NAV = [
   { key: "2", to: "/wallet", label: "WALLET" },
   { key: "3", to: "/transfers", label: "TRANSFERS" },
   { key: "4", to: "/manifesto", label: "MANIFESTO" },
+  { key: "5", to: "/dashboard", label: "DASHBOARD" },
 ];
 
 /* -- boot sequence -------------------------------------------------------- */

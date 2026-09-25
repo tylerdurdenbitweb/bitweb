@@ -8,16 +8,14 @@
     <link rel="icon" type="image/png" sizes="16x16" href="./favicon-16.png" />
     <link rel="apple-touch-icon" sizes="180x180" href="./apple-touch-icon.png" />
     <link rel="manifest" href="./manifest.webmanifest" />
-    <!-- Kill the fallback-font flash: all three first-paint faces (display,
-         body, ASCII-art coverage) are fetched with top priority before the
-         CSS even parses, and every @font-face is font-display:block - so the
-         first painted text ALREADY renders in VT323 / IBM Plex Mono / Noto
-         Sans Mono instead of flashing a system font. (crossorigin is required
-         on font preloads even same-origin - fonts load in CORS mode, and the
-         request must match the CSS fetch.) -->
-    <link rel="preload" href="/fonts/vt323-400.woff2" as="font" type="font/woff2" crossorigin />
-    <link rel="preload" href="/fonts/plex-mono-400.woff2" as="font" type="font/woff2" crossorigin />
-    <link rel="preload" href="/fonts/noto-sans-mono-400.woff2" as="font" type="font/woff2" crossorigin />
+    <!-- Fonts: all faces live in src/assets and are referenced RELATIVELY
+         from index.css, so Vite bundles them with content hashes and rewrites
+         the URLs correctly under ANY deploy base (GitHub Pages project
+         subpaths included - absolute /fonts/* URLs 404 there). No preloads:
+         a hashed bundle path is unknowable here, and the render-blocking CSS
+         fetches the faces before first paint anyway; font-display:block in
+         the CSS guarantees the first painted text already wears VT323 /
+         IBM Plex Mono / Noto Sans Mono instead of flashing a system font. -->
     <meta name="theme-color" content="#000000" />
     <!-- iOS installability: Safari ignores the manifest, these are its hooks -->
     <meta name="apple-mobile-web-app-capable" content="yes" />

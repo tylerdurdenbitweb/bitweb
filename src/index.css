@@ -1,13 +1,17 @@
 /* Self-hosted fonts - zero third-party requests, zero IP leaks.
-   font-display: block on EVERY face, never swap: this UI is 100% terminal
-   text, so painting a system font for a few frames and then reflowing into
-   the phosphor face is the worst of both worlds. The three first-paint
-   faces (VT323, Plex Mono 400, Noto Sans Mono) are preloaded in index.html,
-   so the block window is one same-origin fetch - milliseconds, not the 3 s
-   worst case - and first paint already wears the right font. */
+   EVERY face is bundled from src/assets with a RELATIVE url: Vite hashes
+   the files and rewrites the urls correctly under any deploy base. Absolute
+   /fonts/* urls 404 on GitHub Pages project subpaths (site lives under
+   /REPO/) - that was the "system font at start" root cause: on the deployed
+   site the faces NEVER loaded. font-display: block on every face, never
+   swap: this UI is 100% terminal text, so painting a system font for a few
+   frames and then reflowing into the phosphor face is the worst of both
+   worlds. The render-blocking CSS fetches the faces before first paint, so
+   the block window is one same-origin fetch - milliseconds, not the 3 s
+   worst case. */
 @font-face {
   font-family: "VT323";
-  src: url("/fonts/vt323-400.woff2") format("woff2");
+  src: url("./assets/fonts/vt323-400.woff2") format("woff2");
   font-weight: 400;
   font-style: normal;
   font-display: block;
@@ -21,35 +25,35 @@
    preload it (a hashed src/assets URL is unknowable at HTML-authoring time). */
 @font-face {
   font-family: "Noto Sans Mono";
-  src: url("/fonts/noto-sans-mono-400.woff2") format("woff2");
+  src: url("./assets/fonts/noto-sans-mono-400.woff2") format("woff2");
   font-weight: 400;
   font-style: normal;
   font-display: block;
 }
 @font-face {
   font-family: "IBM Plex Mono";
-  src: url("/fonts/plex-mono-400.woff2") format("woff2");
+  src: url("./assets/fonts/plex-mono-400.woff2") format("woff2");
   font-weight: 400;
   font-style: normal;
   font-display: block;
 }
 @font-face {
   font-family: "IBM Plex Mono";
-  src: url("/fonts/plex-mono-500.woff2") format("woff2");
+  src: url("./assets/fonts/plex-mono-500.woff2") format("woff2");
   font-weight: 500;
   font-style: normal;
   font-display: block;
 }
 @font-face {
   font-family: "IBM Plex Mono";
-  src: url("/fonts/plex-mono-600.woff2") format("woff2");
+  src: url("./assets/fonts/plex-mono-600.woff2") format("woff2");
   font-weight: 600;
   font-style: normal;
   font-display: block;
 }
 @font-face {
   font-family: "IBM Plex Mono";
-  src: url("/fonts/plex-mono-700.woff2") format("woff2");
+  src: url("./assets/fonts/plex-mono-700.woff2") format("woff2");
   font-weight: 700;
   font-style: normal;
   font-display: block;

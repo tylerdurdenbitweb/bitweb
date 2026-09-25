@@ -158,18 +158,37 @@ export function withStallGuard<T>(
   });
 }
 
-function req<T>(r: IDBRequest<T>, onStall?: () => void): Promise<T> {
+function req<T>(r: IDBRequest<T>, onStall?: () => void, stallMs?: number): Promise<T> {
   return withStallGuard(
     new Promise<T>((resolve, reject) => {
       r.onsuccess = () => resolve(r.result);
       r.onerror = () => reject(r.error ?? new Error("indexeddb request failed"));
     }),
     onStall,
+    stallMs,
   );
 }
 
-function openDb(): Promise<IDBDatabase> {
+/**
+ * Opening the database gets the same zombie protection as every other
+ * request: an installed PWA cold-starting next to a frozen sibling context
+ * can see indexedDB.open() queue FOREVER (no success, no error, no blocked)
+ * - before this guard, that was the "OPENING NODE DATABASE" screen hanging
+ * until the app was killed. A late-settling attempt is closed immediately
+ * so an untracked connection never leaks past the guard.
+ */
+const OPEN_STALL_MS = 10_000;
+const OPEN_ATTEMPTS = 3;
+
+function openDb(stallMs: number, onStall: () => void): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      onStall();
+      reject(new IdbStallError());
+    }, stallMs);
     const r = indexedDB.open(DB_NAME, DB_VERSION);
     r.onupgradeneeded = () => {
       const db = r.result;
@@ -192,15 +211,59 @@ function openDb(): Promise<IDBDatabase> {
         db.createObjectStore("snapshots", { keyPath: "height" }); // v2
       }
     };
-    r.onsuccess = () => resolve(r.result);
-    r.onerror = () => reject(r.error ?? new Error("indexeddb open failed"));
-    r.onblocked = () => reject(new Error("indexeddb blocked by another tab version"));
+    r.onsuccess = () => {
+      if (settled) {
+        // the stall guard already abandoned this attempt - never leak the
+        // late connection (untracked, it would block future version changes)
+        try {
+          r.result.close();
+        } catch {
+          /* already gone */
+        }
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      resolve(r.result);
+    };
+    r.onerror = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(r.error ?? new Error("indexeddb open failed"));
+    };
+    r.onblocked = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(new Error("indexeddb blocked by another tab version"));
+    };
   });
 }
 
+/**
+ * A stalled open means the request is frozen inside a dead context - it can
+ * never be cancelled, so the recovery is a FRESH open call, a few times,
+ * before the boot gives up and falls back to memory-only mode.
+ */
+async function openDbWithRetry(
+  onStall: () => void,
+  stallMs: number,
+  attempts: number,
+): Promise<IDBDatabase> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await openDb(stallMs, onStall);
+    } catch (err) {
+      if (!(err instanceof IdbStallError) || attempt >= attempts) throw err;
+      await new Promise((r) => setTimeout(r, 400));
+    }
+  }
+}
+
 /** Read-only helpers bound to any transaction-ish handle. */
-function readsFrom(get: (store: ChainStore) => IDBObjectStore, onStall?: () => void) {
-  const reqS = <T,>(r: IDBRequest<T>): Promise<T> => req(r, onStall);
+function readsFrom(get: (store: ChainStore) => IDBObjectStore, onStall?: () => void, stallMs?: number) {
+  const reqS = <T,>(r: IDBRequest<T>): Promise<T> => req(r, onStall, stallMs);
   const mpAll = async (): Promise<MempoolTxRow[]> => {
     const rows = (await reqS(get("mempool").getAll())) as MempoolDisk[];
     return rows
@@ -221,6 +284,7 @@ function readsFrom(get: (store: ChainStore) => IDBObjectStore, onStall?: () => v
         };
       }),
       onStall,
+      stallMs,
     );
   return {
     async blockCount() {
@@ -277,6 +341,7 @@ function readsFrom(get: (store: ChainStore) => IDBObjectStore, onStall?: () => v
           };
         }),
         onStall,
+        stallMs,
       );
       return out.sort(
         (a, b) => b.blockHeight - a.blockHeight || b.timestamp - a.timestamp,
@@ -343,6 +408,16 @@ type Reads = ReturnType<typeof readsFrom>;
 export class IdbStorage implements ChainStorage {
   private db: IDBDatabase | null = null;
   private reads: Reads | null = null;
+  /** Test hooks - production boots never pass these. */
+  private readonly openStallMs: number;
+  private readonly openAttempts: number;
+  private readonly stallMs: number;
+
+  constructor(opts: { openStallMs?: number; openAttempts?: number; stallMs?: number } = {}) {
+    this.openStallMs = opts.openStallMs ?? OPEN_STALL_MS;
+    this.openAttempts = opts.openAttempts ?? OPEN_ATTEMPTS;
+    this.stallMs = opts.stallMs ?? IDB_STALL_MS;
+  }
   /**
    * Set by any stalled request (see IdbStallError) or by reopen(): the
    * connection is considered a zombie and the next operation reopens it
@@ -383,7 +458,7 @@ export class IdbStorage implements ChainStorage {
         } catch {
           /* already gone */
         }
-        const db = await openDb();
+        const db = await openDbWithRetry(this.onStall, this.openStallMs, this.openAttempts);
         // Another tab upgrading the schema must not deadlock us: poison and
         // close - the next operation reopens on the new version by itself.
         db.onversionchange = () => {
@@ -398,6 +473,7 @@ export class IdbStorage implements ChainStorage {
         this.reads = readsFrom(
           (store) => db.transaction(store, "readonly").objectStore(store),
           this.onStall,
+          this.stallMs,
         );
         this.poisoned = false;
       } finally {
@@ -413,35 +489,55 @@ export class IdbStorage implements ChainStorage {
     return this.reads;
   }
 
-  blockCount = async () => (await this.ro()).blockCount();
-  tip = async () => (await this.ro()).tip();
-  blockAt = async (h: number) => (await this.ro()).blockAt(h);
-  recentBlocks = async (l: number) => (await this.ro()).recentBlocks(l);
-  lastBlockTimestamps = async (l: number) => (await this.ro()).lastBlockTimestamps(l);
-  hashrateWindow = async (l: number) => (await this.ro()).hashrateWindow(l);
-  txByTxid = async (t: string) => (await this.ro()).txByTxid(t);
-  txsInBlock = async (h: number) => (await this.ro()).txsInBlock(h);
-  confirmedCount = async () => (await this.ro()).confirmedCount();
-  recentTxs = async (l: number) => (await this.ro()).recentTxs(l);
-  txHistoryFor = async (a: string, l: number) => (await this.ro()).txHistoryFor(a, l);
-  mempoolTxByTxid = async (t: string) => (await this.ro()).mempoolTxByTxid(t);
-  mempool = async () => (await this.ro()).mempool();
-  mempoolFrom = async (f: string) => (await this.ro()).mempoolFrom(f);
-  mempoolForAddress = async (a: string) => (await this.ro()).mempoolForAddress(a);
-  mempoolCount = async () => (await this.ro()).mempoolCount();
-  account = async (a: string) => (await this.ro()).account(a);
-  activeAccountCount = async () => (await this.ro()).activeAccountCount();
-  allAccounts = async () => (await this.ro()).allAccounts();
-  latestSnapshot = async () => (await this.ro()).latestSnapshot();
-  getMeta = async (k: string) => (await this.ro()).getMeta(k);
+  /**
+   * Zombie self-healing for pure operations (reads, wallet lookups): when a
+   * request dies unsettled, the stall guard has already poisoned the
+   * connection - reopen and run the SAME operation once more instead of
+   * letting one frozen request kill a boot or a sync. Writes in chain
+   * transactions are NOT retried here: a partially-applied transaction
+   * cannot be replayed blindly, so transact() surfaces the stall and the
+   * caller's own retry semantics (e.g. the sync gate's in-burst retry)
+   * take over on the now-healthy connection.
+   */
+  private async healAndRetry<T>(op: () => Promise<T>): Promise<T> {
+    try {
+      return await op();
+    } catch (err) {
+      if (!(err instanceof IdbStallError)) throw err;
+      await this.reopen();
+      return op();
+    }
+  }
+
+  blockCount = async () => this.healAndRetry(async () => (await this.ro()).blockCount());
+  tip = async () => this.healAndRetry(async () => (await this.ro()).tip());
+  blockAt = async (h: number) => this.healAndRetry(async () => (await this.ro()).blockAt(h));
+  recentBlocks = async (l: number) => this.healAndRetry(async () => (await this.ro()).recentBlocks(l));
+  lastBlockTimestamps = async (l: number) => this.healAndRetry(async () => (await this.ro()).lastBlockTimestamps(l));
+  hashrateWindow = async (l: number) => this.healAndRetry(async () => (await this.ro()).hashrateWindow(l));
+  txByTxid = async (t: string) => this.healAndRetry(async () => (await this.ro()).txByTxid(t));
+  txsInBlock = async (h: number) => this.healAndRetry(async () => (await this.ro()).txsInBlock(h));
+  confirmedCount = async () => this.healAndRetry(async () => (await this.ro()).confirmedCount());
+  recentTxs = async (l: number) => this.healAndRetry(async () => (await this.ro()).recentTxs(l));
+  txHistoryFor = async (a: string, l: number) => this.healAndRetry(async () => (await this.ro()).txHistoryFor(a, l));
+  mempoolTxByTxid = async (t: string) => this.healAndRetry(async () => (await this.ro()).mempoolTxByTxid(t));
+  mempool = async () => this.healAndRetry(async () => (await this.ro()).mempool());
+  mempoolFrom = async (f: string) => this.healAndRetry(async () => (await this.ro()).mempoolFrom(f));
+  mempoolForAddress = async (a: string) => this.healAndRetry(async () => (await this.ro()).mempoolForAddress(a));
+  mempoolCount = async () => this.healAndRetry(async () => (await this.ro()).mempoolCount());
+  account = async (a: string) => this.healAndRetry(async () => (await this.ro()).account(a));
+  activeAccountCount = async () => this.healAndRetry(async () => (await this.ro()).activeAccountCount());
+  allAccounts = async () => this.healAndRetry(async () => (await this.ro()).allAccounts());
+  latestSnapshot = async () => this.healAndRetry(async () => (await this.ro()).latestSnapshot());
+  getMeta = async (k: string) => this.healAndRetry(async () => (await this.ro()).getMeta(k));
 
   async transact<T>(fn: (tx: ChainStorageTx) => Promise<T>): Promise<T> {
     await this.ensureOpen();
     if (!this.db) throw new Error("IdbStorage not open");
-    const reqS = <R,>(r: IDBRequest<R>): Promise<R> => req(r, this.onStall);
+    const reqS = <R,>(r: IDBRequest<R>): Promise<R> => req(r, this.onStall, this.stallMs);
     const idbTx = this.db.transaction([...CHAIN_STORES], "readwrite");
     const store = (s: ChainStore) => idbTx.objectStore(s);
-    const reads = readsFrom(store, this.onStall);
+    const reads = readsFrom(store, this.onStall, this.stallMs);
     const tx: ChainStorageTx = {
       ...reads,
       async putBlock(b) {
@@ -489,6 +585,7 @@ export class IdbStorage implements ChainStorage {
         idbTx.onabort = () => reject(idbTx.error ?? new Error("chain transaction aborted"));
       }),
       this.onStall,
+      this.stallMs,
     );
     done.catch(() => undefined); // pre-attach: rejection is handled below
     try {
@@ -522,34 +619,48 @@ export class IdbStorage implements ChainStorage {
         idbTx.onabort = () => reject(idbTx.error ?? new Error("deleteAll aborted"));
       }),
       this.onStall,
+      this.stallMs,
     );
   }
 
   // -- wallet store (outside chain transactions) ----------------------------
+  // The wallet row is read during boot hydration: a zombie stall here used
+  // to surface as a fatal NODE BOOT FAILURE. These are single-request
+  // idempotent operations (get / put of the same value / delete), so the
+  // heal-and-retry path is safe for all three.
   async walletGet(id: string): Promise<{ id: string; privHex: string } | undefined> {
-    await this.ensureOpen();
-    if (!this.db) throw new Error("IdbStorage not open");
-    return (await req(
-      this.db.transaction("wallet", "readonly").objectStore("wallet").get(id),
-      this.onStall,
-    )) as { id: string; privHex: string } | undefined;
+    return this.healAndRetry(async () => {
+      await this.ensureOpen();
+      if (!this.db) throw new Error("IdbStorage not open");
+      return (await req(
+        this.db.transaction("wallet", "readonly").objectStore("wallet").get(id),
+        this.onStall,
+        this.stallMs,
+      )) as { id: string; privHex: string } | undefined;
+    });
   }
 
   async walletPut(privHex: string): Promise<void> {
-    await this.ensureOpen();
-    if (!this.db) throw new Error("IdbStorage not open");
-    await req(
-      this.db.transaction("wallet", "readwrite").objectStore("wallet").put({ id: "main", privHex }),
-      this.onStall,
-    );
+    return this.healAndRetry(async () => {
+      await this.ensureOpen();
+      if (!this.db) throw new Error("IdbStorage not open");
+      await req(
+        this.db.transaction("wallet", "readwrite").objectStore("wallet").put({ id: "main", privHex }),
+        this.onStall,
+        this.stallMs,
+      );
+    });
   }
 
   async walletClear(): Promise<void> {
-    await this.ensureOpen();
-    if (!this.db) throw new Error("IdbStorage not open");
-    await req(
-      this.db.transaction("wallet", "readwrite").objectStore("wallet").delete("main"),
-      this.onStall,
-    );
+    return this.healAndRetry(async () => {
+      await this.ensureOpen();
+      if (!this.db) throw new Error("IdbStorage not open");
+      await req(
+        this.db.transaction("wallet", "readwrite").objectStore("wallet").delete("main"),
+        this.onStall,
+        this.stallMs,
+      );
+    });
   }
 }

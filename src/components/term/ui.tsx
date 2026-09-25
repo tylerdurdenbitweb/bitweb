@@ -106,12 +106,18 @@ export function TerminalProgressBar({
   const ratio = determinate ? Math.min(1, Math.max(0, current / total)) : 0;
   const filled = Math.round(ratio * WIDTH);
   const pct = determinate ? Math.floor(ratio * 100) : null;
+  // The bar is one unbreakable glyph string, so IT must adapt to the panel
+  // - never the other way round. The font size scales with the viewport
+  // (browser text zoom shrinks the CSS viewport, so zoom self-corrects),
+  // and the overflow guard clips a worst-case render instead of letting the
+  // bar spill out of its window (Firefox mobile text scaling hit exactly
+  // this before the clamp existed).
   return (
     <div
       data-testid="terminal-progress-bar"
       data-determinate={determinate || undefined}
       className={cn(
-        "ascii select-none whitespace-nowrap text-center text-neutral-200",
+        "ascii mx-auto w-fit max-w-full select-none overflow-hidden whitespace-nowrap text-center text-[clamp(10px,4vw,14px)] text-neutral-200",
         !determinate && "blink",
         className,
       )}

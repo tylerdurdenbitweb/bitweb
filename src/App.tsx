@@ -1,4 +1,5 @@
-import { lazy, Suspense } from "react";
+import { Suspense } from "react";
+import { lazyRoute } from "@/lib/lazy-route";
 import { Routes, Route, Link } from "react-router";
 import { Layout } from "@/components/term/Layout";
 import { ErrorBoundary } from "@/components/term/ErrorBoundary";
@@ -7,10 +8,12 @@ import Terminal from "./pages/Terminal";
 // Secondary pages load on demand - the landing Terminal stays eager so
 // first paint never waits on a chunk (and the QR vendor code only downloads
 // when a page that renders codes is actually visited).
-const Dashboard = lazy(() => import("./pages/Dashboard"));
-const Wallet = lazy(() => import("./pages/Wallet"));
-const Transfers = lazy(() => import("./pages/Transfers"));
-const Manifesto = lazy(() => import("./pages/Manifesto"));
+// lazyRoute validates the chunk namespace before React touches it - see
+// lazy-route.tsx for the Safari empty-module crash this prevents.
+const Dashboard = lazyRoute(() => import("./pages/Dashboard"));
+const Wallet = lazyRoute(() => import("./pages/Wallet"));
+const Transfers = lazyRoute(() => import("./pages/Transfers"));
+const Manifesto = lazyRoute(() => import("./pages/Manifesto"));
 
 function PageLoader() {
   return (

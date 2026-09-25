@@ -1203,7 +1203,14 @@ export class P2pEngine {
       let current = peerId;
       for (let aborts = 0; !this.stopped; ) {
         const before = (await getTipSummary()).height;
-        await this.syncFromPeerInner(current);
+        try {
+          await this.syncFromPeerInner(current);
+        } catch (err) {
+          // A failing round (e.g. storage throwing IdbStallError while the
+          // zombie connection heals itself) counts as a motionless abort:
+          // the SAME gate burst retries instead of dying mid-overlay.
+          console.warn("[p2p] sync round failed - retrying inside the gate:", err);
+        }
         const tip = (await getTipSummary()).height;
         const targetNow = Math.max(this.peers.get(current)?.hello?.height ?? 0, this.bestKnown);
         if (targetNow <= tip) break; // caught up - gate closes at 100%

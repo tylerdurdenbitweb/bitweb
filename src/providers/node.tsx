@@ -72,7 +72,7 @@ function BootSplash() {
         >
           {boot.phase ? boot.phase.toUpperCase() : "\u00a0"}
         </p>
-        <TerminalProgressBar current={cur} total={tot} className="mt-3 text-sm" />
+        <TerminalProgressBar current={cur} total={tot} className="mt-3" />
         {cur !== null && tot !== null && boot.windowStart === null ? (
           <p
             data-testid="boot-splash-counts"

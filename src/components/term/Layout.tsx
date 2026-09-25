@@ -135,7 +135,7 @@ function ChainUpdateOverlay() {
         <TerminalProgressBar
           current={state.progress?.current ?? null}
           total={state.progress?.total ?? null}
-          className="mt-4 text-sm"
+          className="mt-4"
         />
         {state.progress ? (
           <p

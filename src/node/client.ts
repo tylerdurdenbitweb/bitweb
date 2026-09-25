@@ -30,7 +30,7 @@ import {
   type TemplateView,
 } from "./chain";
 export { ChainConflictError, ChainDowngradeError } from "./chain";
-import { IdbStorage } from "./idb";
+import { IdbStallError, IdbStorage } from "./idb";
 import { MemoryStorage } from "./storage";
 import { P2pEngine, type PeerView } from "./p2p";
 import type { ChainStorage } from "./storage";
@@ -166,7 +166,18 @@ async function bootFresh(opts: BootOptions = {}): Promise<NodeHandle> {
   // 2. chain (genesis sealed idempotently; boot recovery narrates its own
   // "verifying stored chain" / "rebuilding derived state" phases from here)
   setBootPhase("sealing genesis");
-  await initChain(storage);
+  try {
+    await initChain(storage);
+  } catch (err) {
+    // A zombie connection can still slip a stall past the storage layer's
+    // self-healing reads (genesis sealing is a WRITE transaction, which is
+    // never blindly replayed). initChain is idempotent and re-runnable, so
+    // reopen the database and take ONE fresh run at it before giving up.
+    if (!(err instanceof IdbStallError) || !storage.reopen) throw err;
+    console.warn("[boot] genesis read stalled on a zombie connection - reopening and retrying once");
+    await storage.reopen();
+    await initChain(storage);
+  }
 
   // 2.5 boot gate: from the first hydration step until the network's first
   // sync decision, the whole app stays passive - the UPDATING overlay is up

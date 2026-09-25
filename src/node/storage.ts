@@ -167,6 +167,14 @@ export interface ChainStorage extends ChainStorageReader {
 
   /** Wipe every store (protocol-epoch reset). */
   deleteAll(): Promise<void>;
+
+  /**
+   * Close and reopen the underlying connection. iOS Safari can zombie an
+   * IndexedDB connection across a page freeze (requests then NEVER settle),
+   * so the wake path calls this proactively; in-memory storages simply do
+   * not implement it. Reopening never loses data - IDB close() is graceful.
+   */
+  reopen?(): Promise<void>;
 }
 
 export interface ChainStorageTx extends ChainStorageReader {

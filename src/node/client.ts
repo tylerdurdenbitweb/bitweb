@@ -276,6 +276,15 @@ async function bootFresh(opts: BootOptions = {}): Promise<NodeHandle> {
       const now = Date.now();
       if (now - lastWake < 1_000) return;
       lastWake = now;
+      // The storage connection can zombie across the same sleep that killed
+      // the sockets (requests then never settle). Reopen it proactively -
+      // graceful IDB close, zero data risk - so the FIRST post-wake chain
+      // read does not have to discover the zombie via a 15s stall timeout.
+      if (storage.reopen) {
+        void storage.reopen().catch((err) => {
+          console.warn("[wake] storage reopen failed (next op retries):", err);
+        });
+      }
       engine.revive();
     };
     const onPageShow = (e: Event) => {

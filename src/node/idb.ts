@@ -112,11 +112,60 @@ const snapFromDisk = (s: SnapshotDisk): SnapshotRow => ({
 });
 
 // -- low-level helpers -------------------------------------------------------
-function req<T>(r: IDBRequest<T>): Promise<T> {
-  return new Promise((resolve, reject) => {
-    r.onsuccess = () => resolve(r.result);
-    r.onerror = () => reject(r.error ?? new Error("indexeddb request failed"));
+
+/**
+ * Thrown when an IndexedDB request/transaction never settles. iOS Safari can
+ * zombie a connection across a page freeze (screen lock, bfcache, app
+ * switcher): the handle stays "open" but every request queues forever -
+ * before this guard existed, a single stalled request froze a sync overlay
+ * or a boot forever with zero diagnostics.
+ */
+export class IdbStallError extends Error {
+  constructor() {
+    super("indexeddb request never settled - zombie connection after page sleep");
+    this.name = "IdbStallError";
+  }
+}
+
+/** Generous on purpose: legit operations here are all sub-second. */
+const IDB_STALL_MS = 15_000;
+
+/**
+ * Race an IDB promise against the stall timer; a stall poisons the owner.
+ * Exported (with an injectable clock) so the zombie-connection guard is
+ * testable without a real IndexedDB; production callers never pass stallMs.
+ */
+export function withStallGuard<T>(
+  inner: Promise<T>,
+  onStall?: () => void,
+  stallMs: number = IDB_STALL_MS,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => {
+      onStall?.();
+      reject(new IdbStallError());
+    }, stallMs);
+    inner.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      },
+    );
   });
+}
+
+function req<T>(r: IDBRequest<T>, onStall?: () => void): Promise<T> {
+  return withStallGuard(
+    new Promise<T>((resolve, reject) => {
+      r.onsuccess = () => resolve(r.result);
+      r.onerror = () => reject(r.error ?? new Error("indexeddb request failed"));
+    }),
+    onStall,
+  );
 }
 
 function openDb(): Promise<IDBDatabase> {
@@ -150,35 +199,39 @@ function openDb(): Promise<IDBDatabase> {
 }
 
 /** Read-only helpers bound to any transaction-ish handle. */
-function readsFrom(get: (store: ChainStore) => IDBObjectStore) {
+function readsFrom(get: (store: ChainStore) => IDBObjectStore, onStall?: () => void) {
+  const reqS = <T,>(r: IDBRequest<T>): Promise<T> => req(r, onStall);
   const mpAll = async (): Promise<MempoolTxRow[]> => {
-    const rows = (await req(get("mempool").getAll())) as MempoolDisk[];
+    const rows = (await reqS(get("mempool").getAll())) as MempoolDisk[];
     return rows
       .map(mpFromDisk)
       .sort((a, b) => a.createdAt - b.createdAt || a.txid.localeCompare(b.txid));
   };
   const blocksDesc = (limit: number): Promise<BlockRow[]> =>
-    new Promise((resolve, reject) => {
-      const out: BlockRow[] = [];
-      const c = get("blocks").openCursor(null, "prev");
-      c.onerror = () => reject(c.error);
-      c.onsuccess = () => {
-        const cur = c.result;
-        if (!cur || out.length >= limit) return resolve(out);
-        out.push(blockFromDisk(cur.value as BlockDisk));
-        cur.continue();
-      };
-    });
+    withStallGuard(
+      new Promise<BlockRow[]>((resolve, reject) => {
+        const out: BlockRow[] = [];
+        const c = get("blocks").openCursor(null, "prev");
+        c.onerror = () => reject(c.error);
+        c.onsuccess = () => {
+          const cur = c.result;
+          if (!cur || out.length >= limit) return resolve(out);
+          out.push(blockFromDisk(cur.value as BlockDisk));
+          cur.continue();
+        };
+      }),
+      onStall,
+    );
   return {
     async blockCount() {
-      return req(get("blocks").count());
+      return reqS(get("blocks").count());
     },
     async tip() {
       const rows = await blocksDesc(1);
       return rows[0];
     },
     async blockAt(height: number) {
-      const b = (await req(get("blocks").get(height))) as BlockDisk | undefined;
+      const b = (await reqS(get("blocks").get(height))) as BlockDisk | undefined;
       return b ? blockFromDisk(b) : undefined;
     },
     async recentBlocks(limit: number) {
@@ -195,11 +248,11 @@ function readsFrom(get: (store: ChainStore) => IDBObjectStore) {
       }));
     },
     async txByTxid(txid: string) {
-      const t = (await req(get("transactions").get(txid))) as TxDisk | undefined;
+      const t = (await reqS(get("transactions").get(txid))) as TxDisk | undefined;
       return t ? txFromDisk(t) : undefined;
     },
     async txsInBlock(height: number) {
-      const rows = (await req(
+      const rows = (await reqS(
         get("transactions").index("blockHeight").getAll(IDBKeyRange.only(height)),
       )) as TxDisk[];
       return rows
@@ -207,29 +260,32 @@ function readsFrom(get: (store: ChainStore) => IDBObjectStore) {
         .sort((a, b) => a.txIndex - b.txIndex || a.txid.localeCompare(b.txid));
     },
     async confirmedCount() {
-      return req(get("transactions").count());
+      return reqS(get("transactions").count());
     },
     async recentTxs(limit: number) {
       const cap = Math.min(limit, 100);
       const out: TxRow[] = [];
-      await new Promise<void>((resolve, reject) => {
-        const c = get("transactions").index("blockHeight").openCursor(null, "prev");
-        c.onerror = () => reject(c.error);
-        c.onsuccess = () => {
-          const cur = c.result;
-          if (!cur || out.length >= cap) return resolve();
-          out.push(txFromDisk(cur.value as TxDisk));
-          cur.continue();
-        };
-      });
+      await withStallGuard(
+        new Promise<void>((resolve, reject) => {
+          const c = get("transactions").index("blockHeight").openCursor(null, "prev");
+          c.onerror = () => reject(c.error);
+          c.onsuccess = () => {
+            const cur = c.result;
+            if (!cur || out.length >= cap) return resolve();
+            out.push(txFromDisk(cur.value as TxDisk));
+            cur.continue();
+          };
+        }),
+        onStall,
+      );
       return out.sort(
         (a, b) => b.blockHeight - a.blockHeight || b.timestamp - a.timestamp,
       );
     },
     async txHistoryFor(address: string, limit: number) {
       const [out, inc] = await Promise.all([
-        req(get("transactions").index("fromAddress").getAll(IDBKeyRange.only(address))),
-        req(get("transactions").index("toAddress").getAll(IDBKeyRange.only(address))),
+        reqS(get("transactions").index("fromAddress").getAll(IDBKeyRange.only(address))),
+        reqS(get("transactions").index("toAddress").getAll(IDBKeyRange.only(address))),
       ]);
       const seen = new Map<string, TxRow>();
       for (const raw of [...out, ...inc] as TxDisk[]) {
@@ -241,7 +297,7 @@ function readsFrom(get: (store: ChainStore) => IDBObjectStore) {
         .slice(0, limit);
     },
     async mempoolTxByTxid(txid: string) {
-      const t = (await req(get("mempool").get(txid))) as MempoolDisk | undefined;
+      const t = (await reqS(get("mempool").get(txid))) as MempoolDisk | undefined;
       return t ? mpFromDisk(t) : undefined;
     },
     mempool: mpAll,
@@ -254,29 +310,29 @@ function readsFrom(get: (store: ChainStore) => IDBObjectStore) {
       );
     },
     async mempoolCount() {
-      return req(get("mempool").count());
+      return reqS(get("mempool").count());
     },
     async account(address: string) {
-      const a = (await req(get("balances").get(address))) as AccountDisk | undefined;
+      const a = (await reqS(get("balances").get(address))) as AccountDisk | undefined;
       return a ? accFromDisk(a) : undefined;
     },
     async activeAccountCount() {
-      const all = (await req(get("balances").getAll())) as AccountDisk[];
+      const all = (await reqS(get("balances").getAll())) as AccountDisk[];
       return all.filter((a) => fromU64(a.balance) > 0).length;
     },
     async allAccounts() {
-      const all = (await req(get("balances").getAll())) as AccountDisk[];
+      const all = (await reqS(get("balances").getAll())) as AccountDisk[];
       return all.map(accFromDisk);
     },
     async latestSnapshot() {
-      const keys = (await req(get("snapshots").getAllKeys())) as number[];
+      const keys = (await reqS(get("snapshots").getAllKeys())) as number[];
       if (keys.length === 0) return undefined;
       const top = Math.max(...keys);
-      const snap = (await req(get("snapshots").get(top))) as SnapshotDisk | undefined;
+      const snap = (await reqS(get("snapshots").get(top))) as SnapshotDisk | undefined;
       return snap ? snapFromDisk(snap) : undefined;
     },
     async getMeta(key: string) {
-      const row = (await req(get("meta").get(key))) as { key: string; value: string } | undefined;
+      const row = (await reqS(get("meta").get(key))) as { key: string; value: string } | undefined;
       return row?.value;
     },
   };
@@ -287,94 +343,153 @@ type Reads = ReturnType<typeof readsFrom>;
 export class IdbStorage implements ChainStorage {
   private db: IDBDatabase | null = null;
   private reads: Reads | null = null;
+  /**
+   * Set by any stalled request (see IdbStallError) or by reopen(): the
+   * connection is considered a zombie and the next operation reopens it
+   * before touching IndexedDB again.
+   */
+  private poisoned = false;
+  /** Single-flight lock so concurrent callers share one reopen. */
+  private reopening: Promise<void> | null = null;
+
+  private onStall = (): void => {
+    this.poisoned = true;
+  };
 
   async open(): Promise<void> {
-    if (this.db) return;
-    this.db = await openDb();
-    // If another tab ever upgrades the schema, yield immediately instead of
-    // deadlocking its open() (blocked-event) - this tab reopens on reload.
-    this.db.onversionchange = () => this.db?.close();
-    const db = this.db;
-    this.reads = readsFrom((store) => db.transaction(store, "readonly").objectStore(store));
+    await this.ensureOpen();
   }
 
-  private r(): Reads {
+  /**
+   * Proactively reopen the connection (called on the wake path). IDB
+   * close() is graceful - in-flight transactions settle or their stall
+   * guards reject them - so this never corrupts or loses data.
+   */
+  async reopen(): Promise<void> {
+    this.poisoned = true;
+    await this.ensureOpen();
+  }
+
+  private async ensureOpen(): Promise<void> {
+    if (this.db && !this.poisoned) return;
+    if (this.reopening) return this.reopening;
+    this.reopening = (async () => {
+      try {
+        const old = this.db;
+        this.db = null;
+        this.reads = null;
+        try {
+          old?.close();
+        } catch {
+          /* already gone */
+        }
+        const db = await openDb();
+        // Another tab upgrading the schema must not deadlock us: poison and
+        // close - the next operation reopens on the new version by itself.
+        db.onversionchange = () => {
+          this.poisoned = true;
+          try {
+            db.close();
+          } catch {
+            /* already closed */
+          }
+        };
+        this.db = db;
+        this.reads = readsFrom(
+          (store) => db.transaction(store, "readonly").objectStore(store),
+          this.onStall,
+        );
+        this.poisoned = false;
+      } finally {
+        this.reopening = null;
+      }
+    })();
+    return this.reopening;
+  }
+
+  private async ro(): Promise<Reads> {
+    await this.ensureOpen();
     if (!this.reads) throw new Error("IdbStorage not open");
     return this.reads;
   }
 
-  blockCount = () => this.r().blockCount();
-  tip = () => this.r().tip();
-  blockAt = (h: number) => this.r().blockAt(h);
-  recentBlocks = (l: number) => this.r().recentBlocks(l);
-  lastBlockTimestamps = (l: number) => this.r().lastBlockTimestamps(l);
-  hashrateWindow = (l: number) => this.r().hashrateWindow(l);
-  txByTxid = (t: string) => this.r().txByTxid(t);
-  txsInBlock = (h: number) => this.r().txsInBlock(h);
-  confirmedCount = () => this.r().confirmedCount();
-  recentTxs = (l: number) => this.r().recentTxs(l);
-  txHistoryFor = (a: string, l: number) => this.r().txHistoryFor(a, l);
-  mempoolTxByTxid = (t: string) => this.r().mempoolTxByTxid(t);
-  mempool = () => this.r().mempool();
-  mempoolFrom = (f: string) => this.r().mempoolFrom(f);
-  mempoolForAddress = (a: string) => this.r().mempoolForAddress(a);
-  mempoolCount = () => this.r().mempoolCount();
-  account = (a: string) => this.r().account(a);
-  activeAccountCount = () => this.r().activeAccountCount();
-  allAccounts = () => this.r().allAccounts();
-  latestSnapshot = () => this.r().latestSnapshot();
-  getMeta = (k: string) => this.r().getMeta(k);
+  blockCount = async () => (await this.ro()).blockCount();
+  tip = async () => (await this.ro()).tip();
+  blockAt = async (h: number) => (await this.ro()).blockAt(h);
+  recentBlocks = async (l: number) => (await this.ro()).recentBlocks(l);
+  lastBlockTimestamps = async (l: number) => (await this.ro()).lastBlockTimestamps(l);
+  hashrateWindow = async (l: number) => (await this.ro()).hashrateWindow(l);
+  txByTxid = async (t: string) => (await this.ro()).txByTxid(t);
+  txsInBlock = async (h: number) => (await this.ro()).txsInBlock(h);
+  confirmedCount = async () => (await this.ro()).confirmedCount();
+  recentTxs = async (l: number) => (await this.ro()).recentTxs(l);
+  txHistoryFor = async (a: string, l: number) => (await this.ro()).txHistoryFor(a, l);
+  mempoolTxByTxid = async (t: string) => (await this.ro()).mempoolTxByTxid(t);
+  mempool = async () => (await this.ro()).mempool();
+  mempoolFrom = async (f: string) => (await this.ro()).mempoolFrom(f);
+  mempoolForAddress = async (a: string) => (await this.ro()).mempoolForAddress(a);
+  mempoolCount = async () => (await this.ro()).mempoolCount();
+  account = async (a: string) => (await this.ro()).account(a);
+  activeAccountCount = async () => (await this.ro()).activeAccountCount();
+  allAccounts = async () => (await this.ro()).allAccounts();
+  latestSnapshot = async () => (await this.ro()).latestSnapshot();
+  getMeta = async (k: string) => (await this.ro()).getMeta(k);
 
   async transact<T>(fn: (tx: ChainStorageTx) => Promise<T>): Promise<T> {
+    await this.ensureOpen();
     if (!this.db) throw new Error("IdbStorage not open");
+    const reqS = <R,>(r: IDBRequest<R>): Promise<R> => req(r, this.onStall);
     const idbTx = this.db.transaction([...CHAIN_STORES], "readwrite");
     const store = (s: ChainStore) => idbTx.objectStore(s);
-    const reads = readsFrom(store);
+    const reads = readsFrom(store, this.onStall);
     const tx: ChainStorageTx = {
       ...reads,
       async putBlock(b) {
-        await req(store("blocks").put(blockToDisk(b)));
+        await reqS(store("blocks").put(blockToDisk(b)));
       },
       async putTx(t) {
-        await req(store("transactions").put(txToDisk(t)));
+        await reqS(store("transactions").put(txToDisk(t)));
       },
       async putMempoolTx(t) {
-        await req(store("mempool").put(mpToDisk(t)));
+        await reqS(store("mempool").put(mpToDisk(t)));
       },
       async deleteMempoolTx(txid) {
-        await req(store("mempool").delete(txid));
+        await reqS(store("mempool").delete(txid));
       },
       async purgeMempoolSuperseded(from, nonce) {
-        const rows = (await req(
+        const rows = (await reqS(
           store("mempool").index("fromAddress").getAll(IDBKeyRange.only(from)),
         )) as MempoolDisk[];
         for (const row of rows) {
-          if (row.nonce <= nonce) await req(store("mempool").delete(row.txid));
+          if (row.nonce <= nonce) await reqS(store("mempool").delete(row.txid));
         }
       },
       async deleteTxsInBlock(height) {
-        const rows = (await req(
+        const rows = (await reqS(
           store("transactions").index("blockHeight").getAllKeys(IDBKeyRange.only(height)),
         )) as string[];
-        for (const key of rows) await req(store("transactions").delete(key));
+        for (const key of rows) await reqS(store("transactions").delete(key));
       },
       async deleteBlock(height) {
-        await req(store("blocks").delete(height));
+        await reqS(store("blocks").delete(height));
       },
       async putAccount(acc) {
-        await req(store("balances").put(accToDisk(acc)));
+        await reqS(store("balances").put(accToDisk(acc)));
       },
       async putSnapshot(snap) {
-        await req(store("snapshots").put(snapToDisk(snap)));
+        await reqS(store("snapshots").put(snapToDisk(snap)));
       },
       async setMeta(key, value) {
-        await req(store("meta").put({ key, value }));
+        await reqS(store("meta").put({ key, value }));
       },
     };
-    const done = new Promise<void>((resolve, reject) => {
-      idbTx.oncomplete = () => resolve();
-      idbTx.onabort = () => reject(idbTx.error ?? new Error("chain transaction aborted"));
-    });
+    const done = withStallGuard(
+      new Promise<void>((resolve, reject) => {
+        idbTx.oncomplete = () => resolve();
+        idbTx.onabort = () => reject(idbTx.error ?? new Error("chain transaction aborted"));
+      }),
+      this.onStall,
+    );
     done.catch(() => undefined); // pre-attach: rejection is handled below
     try {
       const result = await fn(tx);
@@ -396,33 +511,45 @@ export class IdbStorage implements ChainStorage {
   }
 
   async deleteAll(): Promise<void> {
+    await this.ensureOpen();
     if (!this.db) throw new Error("IdbStorage not open");
     const idbTx = this.db.transaction([...CHAIN_STORES], "readwrite");
     for (const s of CHAIN_STORES) idbTx.objectStore(s).clear();
-    await new Promise<void>((resolve, reject) => {
-      idbTx.oncomplete = () => resolve();
-      idbTx.onerror = () => reject(idbTx.error);
-      idbTx.onabort = () => reject(idbTx.error ?? new Error("deleteAll aborted"));
-    });
+    await withStallGuard(
+      new Promise<void>((resolve, reject) => {
+        idbTx.oncomplete = () => resolve();
+        idbTx.onerror = () => reject(idbTx.error);
+        idbTx.onabort = () => reject(idbTx.error ?? new Error("deleteAll aborted"));
+      }),
+      this.onStall,
+    );
   }
 
   // -- wallet store (outside chain transactions) ----------------------------
   async walletGet(id: string): Promise<{ id: string; privHex: string } | undefined> {
+    await this.ensureOpen();
     if (!this.db) throw new Error("IdbStorage not open");
     return (await req(
       this.db.transaction("wallet", "readonly").objectStore("wallet").get(id),
+      this.onStall,
     )) as { id: string; privHex: string } | undefined;
   }
 
   async walletPut(privHex: string): Promise<void> {
+    await this.ensureOpen();
     if (!this.db) throw new Error("IdbStorage not open");
     await req(
       this.db.transaction("wallet", "readwrite").objectStore("wallet").put({ id: "main", privHex }),
+      this.onStall,
     );
   }
 
   async walletClear(): Promise<void> {
+    await this.ensureOpen();
     if (!this.db) throw new Error("IdbStorage not open");
-    await req(this.db.transaction("wallet", "readwrite").objectStore("wallet").delete("main"));
+    await req(
+      this.db.transaction("wallet", "readwrite").objectStore("wallet").delete("main"),
+      this.onStall,
+    );
   }
 }

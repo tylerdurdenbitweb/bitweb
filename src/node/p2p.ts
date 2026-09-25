@@ -234,6 +234,8 @@ export class P2pEngine {
   private hadLinks = false;
   private lastLinkAt = 0;
   private lastWatchdogReviveAt = 0;
+  private syncRetryDelayMs: number;
+  private requestTimeoutMs: number;
 
   constructor(
     transports: Transport[],
@@ -242,12 +244,18 @@ export class P2pEngine {
       maxReorgDepth?: number;
       /** Test hook: shrink the wake-watchdog constants. */
       watchdog?: Partial<WatchdogConfig>;
+      /** Pause between in-gate sync retries (tests shrink this). */
+      syncRetryDelayMs?: number;
+      /** getBlocks request timeout (tests shrink this). */
+      requestTimeoutMs?: number;
     } = {},
   ) {
     this.transports = transports;
     this.challengeTimeoutMs = opts.challengeTimeoutMs ?? SYBIL_CHALLENGE_TIMEOUT_MS;
     this.maxReorgDepth = opts.maxReorgDepth ?? MAX_REORG_DEPTH;
     this.watchdogCfg = { ...WATCHDOG_DEFAULTS, ...opts.watchdog };
+    this.syncRetryDelayMs = opts.syncRetryDelayMs ?? 1_500;
+    this.requestTimeoutMs = opts.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
   }
 
   async start(onPeerChange?: () => void): Promise<void> {
@@ -1172,7 +1180,7 @@ export class P2pEngine {
       const timer = setTimeout(() => {
         this.pendingBlocks.delete(peerId);
         resolve([]); // offline peers never earn strikes - a timeout is silence
-      }, REQUEST_TIMEOUT_MS);
+      }, this.requestTimeoutMs);
       this.pendingBlocks.set(peerId, { resolve, timer });
       this.send(peerId, { type: "getBlocks", from, count });
     });
@@ -1185,7 +1193,33 @@ export class P2pEngine {
     // until the peer's tip is reached or the sync aborts.
     const done = beginChainUpdate("syncing with a peer");
     try {
-      await this.syncFromPeerInner(peerId);
+      // A quiet peer mid-catch-up (mobile blip, broker reconnect, request
+      // timeout) used to END the burst on the spot: the overlay vanished at
+      // 60% and the node then waited up to a full heartbeat for the next
+      // attempt - on a phone that reads exactly as "the update froze". Now
+      // the burst RETRIES inside the same gate: any forward motion resets
+      // the counter, three motionless attempts hand control back to the
+      // heartbeat watchdog, and the freshest peer ahead of us takes over.
+      let current = peerId;
+      for (let aborts = 0; !this.stopped; ) {
+        const before = (await getTipSummary()).height;
+        await this.syncFromPeerInner(current);
+        const tip = (await getTipSummary()).height;
+        const targetNow = Math.max(this.peers.get(current)?.hello?.height ?? 0, this.bestKnown);
+        if (targetNow <= tip) break; // caught up - gate closes at 100%
+        aborts = tip > before ? 0 : aborts + 1;
+        if (aborts >= 3) break; // truly stuck - heartbeat re-engages later
+        let best: PeerState | null = null;
+        for (const p of this.peers.values()) {
+          if (p.banned || !p.verified || !p.hello) continue;
+          if (p.hello.height <= tip) continue;
+          if (!best || p.hello.height > (best.hello?.height ?? 0)) best = p;
+        }
+        if (!best) break; // nobody ahead right now
+        current = best.id;
+        setChainGateDetail(`retrying - ${aborts + 1}. attempt`);
+        await new Promise((r) => setTimeout(r, this.syncRetryDelayMs));
+      }
     } finally {
       done();
       this.syncing = false;

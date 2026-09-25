@@ -14,6 +14,8 @@ import { chainHooks } from "@/node/chain";
 import { getChainGateState, subscribeChainGate, type ChainGateState } from "@/node/chain-gate";
 import {
   getBootProgress,
+  setBootPhase,
+  setBootProgress,
   subscribeBootProgress,
   type BootProgressState,
 } from "@/node/boot-progress";
@@ -151,12 +153,21 @@ export function NodeProvider({ children }: { children: ReactNode }) {
         }
       },
     })
-      .then((n) => {
+      .then(async (n) => {
         if (cancelled) {
           n.stop(); // unmounted mid-boot (StrictMode dev double-mount) - no leak
           return;
         }
         handle = n;
+        // Land the splash bar on 100% before it leaves. Boot phases end
+        // early BY DESIGN (a sync decision can release the wait window
+        // mid-animation), and an opening that never showed a full bar reads
+        // as broken - "it opened before 100%". Snap to full, hold a beat so
+        // the eye registers it, then open the terminal.
+        setBootPhase("ready");
+        setBootProgress(1, 1);
+        await new Promise((r) => setTimeout(r, 300));
+        if (cancelled) return; // cleanup stops the handle
         setNode(n);
         // dev-only introspection handle for live network debugging (e2e probes)
         if (import.meta.env.DEV) {

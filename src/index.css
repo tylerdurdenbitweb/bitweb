@@ -1,51 +1,58 @@
-/* Self-hosted fonts - zero third-party requests, zero IP leaks. */
+/* Self-hosted fonts - zero third-party requests, zero IP leaks.
+   font-display: block on EVERY face, never swap: this UI is 100% terminal
+   text, so painting a system font for a few frames and then reflowing into
+   the phosphor face is the worst of both worlds. The three first-paint
+   faces (VT323, Plex Mono 400, Noto Sans Mono) are preloaded in index.html,
+   so the block window is one same-origin fetch - milliseconds, not the 3 s
+   worst case - and first paint already wears the right font. */
 @font-face {
   font-family: "VT323";
   src: url("/fonts/vt323-400.woff2") format("woff2");
   font-weight: 400;
   font-style: normal;
-  font-display: swap;
+  font-display: block;
 }
 /* The ASCII wordmark's coverage font: the bundled Plex Mono subset has NO
    box-drawing/block glyphs, so every block and corner glyph fell back to
    whatever the OS offered - aligned on most desktops, broken on many mobile
    browsers. Noto Sans Mono (subset: ASCII + box drawing + block elements)
    covers them all and leads the .ascii stack, so the art always renders in
-   ONE font with ONE advance width. Bundled via Vite (src/assets). */
+   ONE font with ONE advance width. Served from public/ so index.html can
+   preload it (a hashed src/assets URL is unknowable at HTML-authoring time). */
 @font-face {
   font-family: "Noto Sans Mono";
-  src: url("./assets/fonts/noto-sans-mono-400.woff2") format("woff2");
+  src: url("/fonts/noto-sans-mono-400.woff2") format("woff2");
   font-weight: 400;
   font-style: normal;
-  font-display: swap;
+  font-display: block;
 }
 @font-face {
   font-family: "IBM Plex Mono";
   src: url("/fonts/plex-mono-400.woff2") format("woff2");
   font-weight: 400;
   font-style: normal;
-  font-display: swap;
+  font-display: block;
 }
 @font-face {
   font-family: "IBM Plex Mono";
   src: url("/fonts/plex-mono-500.woff2") format("woff2");
   font-weight: 500;
   font-style: normal;
-  font-display: swap;
+  font-display: block;
 }
 @font-face {
   font-family: "IBM Plex Mono";
   src: url("/fonts/plex-mono-600.woff2") format("woff2");
   font-weight: 600;
   font-style: normal;
-  font-display: swap;
+  font-display: block;
 }
 @font-face {
   font-family: "IBM Plex Mono";
   src: url("/fonts/plex-mono-700.woff2") format("woff2");
   font-weight: 700;
   font-style: normal;
-  font-display: swap;
+  font-display: block;
 }
 
 @tailwind base;

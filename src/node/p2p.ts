@@ -159,6 +159,38 @@ export interface PeerView {
   lastSeen: number;
 }
 
+/**
+ * Wake watchdog - the safety net that does NOT trust page events. iOS
+ * Safari (and every iOS browser, they are all WebKit shells) kills
+ * WebSockets silently on screen lock, app-switcher swipes, bfcache restores
+ * and WiFi->cellular handoff, and several of those fire NO pageshow /
+ * visibilitychange / online event at all. Two event-independent signals
+ * cover them:
+ *  - freeze gap: a 1 s interval tick that suddenly measures a multi-second
+ *    jump proves the page was suspended (timers are frozen too, the overdue
+ *    tick fires on resume) - every socket is suspect NOW, even the ones
+ *    iOS keeps looking OPEN.
+ *  - peerless memory: the node once HAD links and lost every single one of
+ *    them outside any freeze - a silent network death. (A node that never
+ *    saw a link stays on the normal reconnect ladders: it may simply be
+ *    alone on the network, and reviving forever would just hammer the
+ *    public brokers.)
+ * Watchdog revives are throttled so a dead-broker boot or a long offline
+ * stretch cannot bounce sessions more than once per REVIVE_MIN interval.
+ */
+export interface WatchdogConfig {
+  tickMs: number;
+  freezeGapMs: number;
+  peerlessMs: number;
+  reviveMinMs: number;
+}
+const WATCHDOG_DEFAULTS: WatchdogConfig = {
+  tickMs: 1_000,
+  freezeGapMs: 5_000,
+  peerlessMs: 20_000,
+  reviveMinMs: 15_000,
+};
+
 export class P2pEngine {
   private peers = new Map<string, PeerState>();
   private activeTransports: Transport[] = [];
@@ -195,14 +227,27 @@ export class P2pEngine {
    * the deep path without mining dozens of blocks.
    */
   private maxReorgDepth: number;
+  /** Wake watchdog state (see WatchdogConfig above the class). */
+  private watchdogCfg: WatchdogConfig;
+  private watchdog: ReturnType<typeof setInterval> | null = null;
+  private lastWatchdogTick = 0;
+  private hadLinks = false;
+  private lastLinkAt = 0;
+  private lastWatchdogReviveAt = 0;
 
   constructor(
     transports: Transport[],
-    opts: { challengeTimeoutMs?: number; maxReorgDepth?: number } = {},
+    opts: {
+      challengeTimeoutMs?: number;
+      maxReorgDepth?: number;
+      /** Test hook: shrink the wake-watchdog constants. */
+      watchdog?: Partial<WatchdogConfig>;
+    } = {},
   ) {
     this.transports = transports;
     this.challengeTimeoutMs = opts.challengeTimeoutMs ?? SYBIL_CHALLENGE_TIMEOUT_MS;
     this.maxReorgDepth = opts.maxReorgDepth ?? MAX_REORG_DEPTH;
+    this.watchdogCfg = { ...WATCHDOG_DEFAULTS, ...opts.watchdog };
   }
 
   async start(onPeerChange?: () => void): Promise<void> {
@@ -234,6 +279,9 @@ export class P2pEngine {
     // Peers re-sign and re-gossip their attestation on this cadence, keeping
     // every potential miner's cache inside the 300s freshness window.
     this.attestTimer = setInterval(() => this.attestRound(), POP_ATTEST_RESEND_MS);
+    // The wake watchdog: event-independent revival (see WatchdogConfig).
+    this.lastWatchdogTick = Date.now();
+    this.watchdog = setInterval(() => this.watchdogTick(), this.watchdogCfg.tickMs);
     chainHooks.onBlockAccepted.push(this.onBlockHook);
     chainHooks.onTxAccepted.push(this.onTxHook);
   }
@@ -289,6 +337,9 @@ export class P2pEngine {
     this.queues.clear();
     if (this.heartbeat) clearInterval(this.heartbeat);
     if (this.attestTimer) clearInterval(this.attestTimer);
+    if (this.watchdog) clearInterval(this.watchdog);
+    this.watchdog = null;
+    this.hadLinks = false;
     this.attestations.clear();
     for (const t of this.activeTransports) t.stop();
     for (const [, p] of this.pendingBlocks) {
@@ -341,6 +392,43 @@ export class P2pEngine {
     }
     this.pushAnnouncedTip();
     if (!this.syncInFlight && this.syncQueued === null) void this.retrySyncIfBehind();
+  }
+
+  /**
+   * One watchdog tick. Two revival triggers, both event-independent:
+   * a wall-clock jump proves the page slept (iOS freezes timers too), and
+   * losing EVERY link we once had - outside any freeze - proves a silent
+   * network death. See the WatchdogConfig comment for the full rationale.
+   */
+  private watchdogTick(): void {
+    if (this.stopped) return;
+    const now = Date.now();
+    const gap = now - this.lastWatchdogTick;
+    this.lastWatchdogTick = now;
+    if (gap >= this.watchdogCfg.freezeGapMs) {
+      this.reviveFromWatchdog("freeze");
+      return;
+    }
+    if (this.peerCount() > 0) {
+      this.hadLinks = true;
+      this.lastLinkAt = now;
+      return;
+    }
+    if (
+      this.hadLinks &&
+      this.hasActiveTransports() &&
+      now - this.lastLinkAt >= this.watchdogCfg.peerlessMs
+    ) {
+      this.reviveFromWatchdog("peerless");
+    }
+  }
+
+  private reviveFromWatchdog(why: "freeze" | "peerless"): void {
+    const now = Date.now();
+    if (now - this.lastWatchdogReviveAt < this.watchdogCfg.reviveMinMs) return;
+    this.lastWatchdogReviveAt = now;
+    console.info(`[p2p] watchdog revive (${why}) - re-proving all transports now`);
+    this.revive();
   }
 
   /**

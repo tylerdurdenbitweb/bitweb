@@ -25,8 +25,10 @@ VERSION="$(node -p "require('./package.json').version" 2>/dev/null || echo "0.0.
   echo "chain: bitweb-mainnet-1"
 } > "$MARKER"
 
+# .github rides along: the Pages deploy workflow must travel WITH the
+# sources, or a fresh repo receiving this zip has no workflow to unpack it.
 zip -r "$TMP" \
-  src contracts public scripts \
+  src contracts public scripts .github \
   index.html network.config.ts \
   package.json package-lock.json \
   tsconfig.json tsconfig.app.json tsconfig.node.json \

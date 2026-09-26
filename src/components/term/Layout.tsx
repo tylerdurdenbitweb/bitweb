@@ -10,6 +10,7 @@ import {
 import { useFeedbackWatcher } from "@/hooks/useFeedbackWatcher";
 import { useStorageWarning } from "@/hooks/useStorageWarning";
 import { useWallet } from "@/hooks/useWallet";
+import { setChainWakeLock } from "@/lib/wake-lock";
 import { NotificationBell } from "@/components/term/NotificationBell";
 import { InstallApp } from "@/components/term/InstallApp";
 import { TerminalProgressBar } from "@/components/term/ui";
@@ -90,8 +91,26 @@ const CHAIN_OVERLAY_HIDE_MS = 150;
 function ChainUpdateOverlay() {
   const [state, setState] = useState<ChainGateState>(() => getChainGateState());
   const [visible, setVisible] = useState(false);
+  // Ticking clock for the liveness line: during a long heal (zombie storage
+  // reopening, a slow peer) the detail text can sit unchanged for seconds -
+  // an unmoving window reads as a crash. The elapsed counter proves the
+  // event loop - and the update - is alive.
+  const [now, setNow] = useState(() => Date.now());
 
   useEffect(() => subscribeChainGate(setState), []);
+
+  // An untouched iPhone auto-locks mid-update and the sleep kills every
+  // socket and zombifies IndexedDB (the "frozen at attempt 2" loop). Hold
+  // the screen awake for exactly the gate's lifetime.
+  useEffect(() => {
+    setChainWakeLock(state.active);
+  }, [state.active]);
+
+  useEffect(() => {
+    if (!visible) return undefined;
+    const t = setInterval(() => setNow(Date.now()), 1_000);
+    return () => clearInterval(t);
+  }, [visible]);
 
   useEffect(() => {
     if (state.active && !visible) {
@@ -144,6 +163,14 @@ function ChainUpdateOverlay() {
           >
             {state.progress.current.toLocaleString("en-US")} /{" "}
             {state.progress.total.toLocaleString("en-US")}
+          </p>
+        ) : null}
+        {state.startedAt ? (
+          <p
+            data-testid="chain-update-elapsed"
+            className="mt-1 text-center text-[10px] tabular-nums tracking-[0.18em] text-neutral-600"
+          >
+            ELAPSED {Math.max(0, Math.floor((now - state.startedAt) / 1000))}S
           </p>
         ) : null}
         <div className="mt-5 border-t border-neutral-800 pt-3 text-center text-[10px] leading-relaxed tracking-[0.14em] text-neutral-500">

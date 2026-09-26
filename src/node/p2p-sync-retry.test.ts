@@ -250,4 +250,152 @@ describe("catch-up sync resilience - quiet peers retried inside one gate", () =>
     expect(fake.reviveCount).toBeGreaterThanOrEqual(1);
     expect((await chainB.getTipSummary()).height).toBe(0); // nothing arrived
   });
+
+  it("a burst that never advances dies at the hard deadline - the overlay ALWAYS closes", async () => {
+    const w1 = walletFromPrivHex("01".repeat(32))!;
+
+    vi.resetModules();
+    const clientA = await import("./client");
+    const { MemoryStorage: MemA } = await import("./storage");
+    const donor = await clientA.bootNode({ storage: new MemA(), transports: [] });
+    const tpl = await donor.template(w1.address);
+    const { nonce } = powSearch(
+      `BTWB1|${tpl.height}|${tpl.prevHash}|${tpl.merkleRoot}|${tpl.minTimestamp}|`,
+      tpl.target,
+    );
+    await donor.submitBlock(tpl.templateId, tpl.minTimestamp, nonce);
+    const donorTip = (await donor.info()).tipHash;
+    donor.stop();
+
+    vi.resetModules();
+    const gate = await import("./chain-gate");
+    const chainB = await import("./chain");
+    const { MemoryStorage: MemB } = await import("./storage");
+    await chainB.initChain(new MemB());
+    const { P2pEngine } = await import("./p2p");
+    const { solveSybilChallenge } = await import("./blockchain");
+
+    const fake = new FakeTransport();
+    const engine = new P2pEngine([fake], {
+      challengeTimeoutMs: 60_000,
+      syncRetryDelayMs: 20,
+      requestTimeoutMs: 700, // each silent round costs 700ms
+      syncBurstDeadlineMs: 400, // ...but the burst dies after 400ms of no motion
+    });
+    cleanup.push(() => engine.stop());
+    await engine.start();
+
+    fake.open("peer-a");
+    await until(() => fake.framesTo("peer-a", "hello").length > 0);
+    const ourHello = (fake.framesTo("peer-a", "hello").at(-1)!.msg as { hello: Record<string, unknown> }).hello;
+    fake.rx("peer-a", { type: "hello", hello: { ...ourHello, height: 1, tipHash: donorTip } });
+    await until(() => fake.framesTo("peer-a", "challenge").length > 0);
+    const ch = fake.framesTo("peer-a", "challenge").at(-1)!.msg as unknown as { nonce: string };
+    fake.rx("peer-a", {
+      type: "challengeResponse",
+      nonce: ch.nonce,
+      solution: solveSybilChallenge(ch.nonce, SYBIL_CHALLENGE_PREFIX),
+    });
+
+    // The 3-abort path would take ~3x700ms + delays (~2.2s) and issue three
+    // requests; the deadline releases the gate after the FIRST silent round.
+    await until(() => !gate.isChainUpdating(), 10_000);
+    await sleep(300); // no further rounds may be issued after the release
+    expect(fake.framesTo("peer-a", "getBlocks").length).toBe(1);
+    expect((await chainB.getTipSummary()).height).toBe(0);
+  });
+
+  it("a slow-but-ALIVE peer completes in ONE round - never an attempt festival", async () => {
+    // The iPhone pattern, reproduced: the link is alive but congested - every
+    // answer needs ~3.5s while the full silence budget is 6s. A halved
+    // "proven peer" follow-up budget (3s) cuts the follow-up request
+    // mid-flight: the round ends motionless, the overlay flips to
+    // "retrying - N. attempt", and a stale late answer has to rescue the next
+    // round. With the full budget the same sync completes inside ONE round -
+    // the gate detail never shows a retry. (Discriminating: the halved
+    // budget DOES reach the tip eventually here, but only via the retry
+    // ladder - which is exactly the phone's "attempts, then stuck" pattern.)
+    const w1 = walletFromPrivHex("01".repeat(32))!;
+
+    vi.resetModules();
+    const clientA = await import("./client");
+    const chainA = await import("./chain");
+    const { MemoryStorage: MemA } = await import("./storage");
+    const donor = await clientA.bootNode({ storage: new MemA(), transports: [] });
+    for (let i = 0; i < 2; i++) {
+      const tpl = await donor.template(w1.address);
+      const { nonce } = powSearch(
+        `BTWB1|${tpl.height}|${tpl.prevHash}|${tpl.merkleRoot}|${tpl.minTimestamp}|`,
+        tpl.target,
+      );
+      await donor.submitBlock(tpl.templateId, tpl.minTimestamp, nonce);
+    }
+    const donorTip = (await donor.info()).tipHash;
+    const wb1 = await chainA.getWireBlock(1);
+    const wb2 = await chainA.getWireBlock(2);
+    expect(wb1 && wb2).toBeTruthy();
+    donor.stop();
+
+    vi.resetModules();
+    const gate = await import("./chain-gate");
+    const details: (string | null)[] = [];
+    const unsub = gate.subscribeChainGate((s) => details.push(s.detail));
+    cleanup.push(unsub);
+    const chainB = await import("./chain");
+    const { MemoryStorage: MemB } = await import("./storage");
+    await chainB.initChain(new MemB());
+    const { P2pEngine } = await import("./p2p");
+    const { solveSybilChallenge } = await import("./blockchain");
+
+    const fake = new FakeTransport();
+    const engine = new P2pEngine([fake], {
+      challengeTimeoutMs: 60_000,
+      syncRetryDelayMs: 10,
+      requestTimeoutMs: 6_000, // full budget; halved would be 3s < 3.5s delay
+    });
+    cleanup.push(() => engine.stop());
+    await engine.start();
+
+    // Scripted peer, answering EVERY request after 3.5s. The first answer is
+    // a gap teaser (block #2 alone): it forces a follow-up request inside the
+    // SAME inner run - the exact request the halved budget used to kill.
+    let seen = 0;
+    const pump = setInterval(() => {
+      const frames = fake.framesTo("peer-a", "getBlocks");
+      while (seen < frames.length) {
+        seen++;
+        const from = (frames[seen - 1].msg as { from: number }).from;
+        const blocks =
+          seen === 1
+            ? [wb2] // gap: "block does not extend our tip" -> re-request same from
+            : ([wb1, wb2].filter((b) => b !== null && b.height >= from) as unknown[]);
+        setTimeout(() => fake.rx("peer-a", { type: "blocks", blocks }), 3_500);
+      }
+    }, 25);
+    cleanup.push(() => clearInterval(pump));
+
+    fake.open("peer-a");
+    await until(() => fake.framesTo("peer-a", "hello").length > 0);
+    const ourHello = (fake.framesTo("peer-a", "hello").at(-1)!.msg as { hello: Record<string, unknown> }).hello;
+    fake.rx("peer-a", { type: "hello", hello: { ...ourHello, height: 2, tipHash: donorTip } });
+    await until(() => fake.framesTo("peer-a", "challenge").length > 0);
+    const ch = fake.framesTo("peer-a", "challenge").at(-1)!.msg as unknown as { nonce: string };
+    fake.rx("peer-a", {
+      type: "challengeResponse",
+      nonce: ch.nonce,
+      solution: solveSybilChallenge(ch.nonce, SYBIL_CHALLENGE_PREFIX),
+    });
+
+    // Slow answers or not, the node lands EXACTLY on the donor tip and the
+    // gate closes - without EVER falling into the retry ladder: request #1
+    // (the gap teaser) plus the follow-up are exactly TWO requests in ONE
+    // burst (the follow-up's short batch ends the inner run at the tip), and
+    // no gate detail ever reads "retrying". The halved budget would time the
+    // follow-up out, flip the overlay to "retrying", and need a second round.
+    await untilAsync(async () => (await chainB.getTipSummary()).hash === donorTip, 45_000);
+    await until(() => !gate.isChainUpdating(), 10_000);
+    expect((await chainB.getTipSummary()).height).toBe(2);
+    expect(seen).toBe(2); // proves the in-run follow-up really happened
+    expect(details.some((d) => d?.startsWith("retrying"))).toBe(false);
+  });
 });

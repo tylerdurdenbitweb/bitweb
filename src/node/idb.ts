@@ -127,8 +127,17 @@ export class IdbStallError extends Error {
   }
 }
 
-/** Generous on purpose: legit operations here are all sub-second. */
-const IDB_STALL_MS = 15_000;
+/**
+ * Legit operations here are all sub-second, so the guard only needs to be
+ * above the slowest honest read on the slowest supported phone - not an
+ * order of magnitude above it. The old 15s budget was that generous: a
+ * single zombie read froze the sync overlay for 15s, the heal-retry circus
+ * behind it could pin the window for a minute, and an iPhone watching a
+ * static overlay re-locks its screen mid-heal (a fresh zombie). 6s is still
+ * far beyond any honest operation and cuts the worst-case freeze by more
+ * than half.
+ */
+const IDB_STALL_MS = 6_000;
 
 /**
  * Race an IDB promise against the stall timer; a stall poisons the owner.

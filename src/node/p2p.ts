@@ -237,6 +237,7 @@ export class P2pEngine {
   private syncRetryDelayMs: number;
   private requestTimeoutMs: number;
   private startCapMs: number;
+  private syncBurstDeadlineMs: number;
 
   constructor(
     transports: Transport[],
@@ -251,6 +252,13 @@ export class P2pEngine {
       requestTimeoutMs?: number;
       /** Hard cap on how long start() waits for transports (tests shrink). */
       startCapMs?: number;
+      /**
+       * Hard cap on a sync burst WITHOUT forward motion. Whatever stalls
+       * underneath (zombie storage mid-heal, silently dead links), the gate
+       * always closes and the heartbeat re-engages later - the overlay can
+       * never ride forever (tests shrink this).
+       */
+      syncBurstDeadlineMs?: number;
     } = {},
   ) {
     this.transports = transports;
@@ -1236,7 +1244,19 @@ export class P2pEngine {
       // the counter, three motionless attempts hand control back to the
       // heartbeat watchdog, and the freshest peer ahead of us takes over.
       let current = peerId;
+      // Forward-motion clock: only a burst that has stopped advancing counts
+      // against the deadline - a healthy catch-up churning through batches is
+      // never cut (it stays inside syncFromPeerInner anyway).
+      let lastProgressAt = Date.now();
       for (let aborts = 0; !this.stopped; ) {
+        // The overlay MUST always close: a burst that has not advanced for
+        // the full deadline (zombie storage healing under a locked screen,
+        // links dying faster than they re-mesh) hands back to the heartbeat
+        // instead of pinning the UPDATING window forever.
+        if (aborts > 0 && Date.now() - lastProgressAt >= this.syncBurstDeadlineMs) {
+          console.warn("[p2p] sync burst stalled past its deadline - releasing the gate");
+          break;
+        }
         const before = (await getTipSummary()).height;
         try {
           await this.syncFromPeerInner(current);
@@ -1249,7 +1269,12 @@ export class P2pEngine {
         const tip = (await getTipSummary()).height;
         const targetNow = Math.max(this.peers.get(current)?.hello?.height ?? 0, this.bestKnown);
         if (targetNow <= tip) break; // caught up - gate closes at 100%
-        aborts = tip > before ? 0 : aborts + 1;
+        if (tip > before) {
+          aborts = 0;
+          lastProgressAt = Date.now();
+        } else {
+          aborts += 1;
+        }
         if (aborts >= 3) break; // truly stuck - heartbeat re-engages later
         if (aborts === 2) {
           // Two motionless rounds is strong evidence the LINK died silently
@@ -1289,11 +1314,12 @@ export class P2pEngine {
 
   private async syncFromPeerInner(peerId: string): Promise<void> {
     let rollbackBudget = this.maxReorgDepth;
-    // A peer that already answered a batch this burst is PROVEN responsive -
-    // follow-up requests get half the silence budget (min 2.5s), so a link
-    // that dies mid-catch-up costs one short beat instead of a full 8s
-    // freeze per round. Unproven peers keep the full timeout.
-    let answeredOnce = false;
+    // Every request carries the FULL silence budget. A halved "proven peer"
+    // budget (an earlier experiment) misread slow-but-alive mobile links as
+    // dead: the first batch loaded, every follow-up timed out, and the burst
+    // burned its attempts without moving - the iPhone "update freezes after
+    // the first blocks" loop. Dead links still cost only the capped retry
+    // ladder above, so there is nothing to win here - only syncs to lose.
     bumpStat("syncsStarted");
     // The overlay bar's target: the tip the peer advertised at handshake
     // (or the highest block we've already seen from it). It can only grow
@@ -1306,14 +1332,8 @@ export class P2pEngine {
       const tip = await getTipSummary();
       setChainGateDetail(`block #${tip.height.toLocaleString("en-US")}`);
       if (target() > tip.height) setChainGateProgress(tip.height, target());
-      const batch = await this.requestBlocks(
-        peerId,
-        tip.height + 1,
-        P2P_BLOCK_BATCH,
-        answeredOnce ? Math.max(2_500, Math.floor(this.requestTimeoutMs / 2)) : undefined,
-      );
+      const batch = await this.requestBlocks(peerId, tip.height + 1, P2P_BLOCK_BATCH);
       if (batch.length === 0) return; // caught up (or peer went quiet)
-      answeredOnce = true;
       let restart = false;
       // Catch-up on a phone must never starve the compositor: the per-block
       // awaits are only microtask-level breathers, so every few blocks we

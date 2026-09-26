@@ -236,6 +236,7 @@ export class P2pEngine {
   private lastWatchdogReviveAt = 0;
   private syncRetryDelayMs: number;
   private requestTimeoutMs: number;
+  private startCapMs: number;
 
   constructor(
     transports: Transport[],
@@ -248,6 +249,8 @@ export class P2pEngine {
       syncRetryDelayMs?: number;
       /** getBlocks request timeout (tests shrink this). */
       requestTimeoutMs?: number;
+      /** Hard cap on how long start() waits for transports (tests shrink). */
+      startCapMs?: number;
     } = {},
   ) {
     this.transports = transports;
@@ -256,6 +259,7 @@ export class P2pEngine {
     this.watchdogCfg = { ...WATCHDOG_DEFAULTS, ...opts.watchdog };
     this.syncRetryDelayMs = opts.syncRetryDelayMs ?? 1_500;
     this.requestTimeoutMs = opts.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
+    this.startCapMs = opts.startCapMs ?? 8_000;
   }
 
   async start(onPeerChange?: () => void): Promise<void> {
@@ -272,16 +276,38 @@ export class P2pEngine {
       onClose: (id) => this.handleClose(id),
       onPeerTip: (id, height, tipHashPrefix) => this.handlePeerTip(id, height, tipHashPrefix),
     };
-    // Each transport is started independently: one failing (e.g. a blocked
-    // signaling rendezvous) must never take the others down with it.
-    for (const t of this.transports) {
-      try {
-        await t.start(events);
-        this.activeTransports.push(t);
-      } catch (err) {
-        console.warn(`[p2p] transport "${t.kind}" failed to start - continuing without it:`, err);
-      }
-    }
+    // Transports start CONCURRENTLY behind a hard cap: one slow rendezvous
+    // (a PeerJS claim probing a blackholed host burns its whole per-host
+    // deadline) used to SERIALIZE with every other transport and hold the
+    // boot screen for tens of seconds - the deterministic "desktop starts
+    // way slower than mobile" gap. Stragglers keep initializing in the
+    // background and join activeTransports the moment they are ready (their
+    // event handlers are wired at start() entry), so the cap costs nothing.
+    const starts = this.transports.map((t) =>
+      Promise.resolve()
+        .then(() => t.start(events))
+        .then(() => {
+          if (this.stopped) {
+            // the engine stopped while this transport was still coming up -
+            // never leave a live transport behind a dead engine
+            try {
+              t.stop();
+            } catch {
+              /* best effort */
+            }
+            return;
+          }
+          this.activeTransports.push(t);
+          this.pushAnnouncedTip();
+        })
+        .catch((err) => {
+          console.warn(`[p2p] transport "${t.kind}" failed to start - continuing without it:`, err);
+        }),
+    );
+    await Promise.race([
+      Promise.allSettled(starts),
+      new Promise((r) => setTimeout(r, this.startCapMs)),
+    ]);
     this.pushAnnouncedTip();
     this.heartbeat = setInterval(() => this.heartbeatRound(), HEARTBEAT_MS);
     // Peers re-sign and re-gossip their attestation on this cadence, keeping
@@ -414,7 +440,16 @@ export class P2pEngine {
     const gap = now - this.lastWatchdogTick;
     this.lastWatchdogTick = now;
     if (gap >= this.watchdogCfg.freezeGapMs) {
-      this.reviveFromWatchdog("freeze");
+      // A catch-up sync legitimately saturates the main thread while blocks
+      // apply - on a phone a big batch reads as multi-second tick gaps.
+      // That is BUSY, not frozen: reviving here used to tear down the very
+      // links feeding the sync, mid-burst (the "update starts, then freezes
+      // at the beginning" loop). While a sync is in flight, only a truly
+      // dead event loop still counts as a freeze.
+      const limit = this.syncing
+        ? Math.max(this.watchdogCfg.freezeGapMs, 20_000)
+        : this.watchdogCfg.freezeGapMs;
+      if (gap >= limit) this.reviveFromWatchdog("freeze");
       return;
     }
     if (this.peerCount() > 0) {
@@ -1170,7 +1205,7 @@ export class P2pEngine {
     }
   }
 
-  private requestBlocks(peerId: string, from: number, count: number): Promise<WireBlock[]> {
+  private requestBlocks(peerId: string, from: number, count: number, timeoutMs?: number): Promise<WireBlock[]> {
     const prev = this.pendingBlocks.get(peerId);
     if (prev) {
       clearTimeout(prev.timer);
@@ -1180,7 +1215,7 @@ export class P2pEngine {
       const timer = setTimeout(() => {
         this.pendingBlocks.delete(peerId);
         resolve([]); // offline peers never earn strikes - a timeout is silence
-      }, this.requestTimeoutMs);
+      }, timeoutMs ?? this.requestTimeoutMs);
       this.pendingBlocks.set(peerId, { resolve, timer });
       this.send(peerId, { type: "getBlocks", from, count });
     });
@@ -1216,6 +1251,15 @@ export class P2pEngine {
         if (targetNow <= tip) break; // caught up - gate closes at 100%
         aborts = tip > before ? 0 : aborts + 1;
         if (aborts >= 3) break; // truly stuck - heartbeat re-engages later
+        if (aborts === 2) {
+          // Two motionless rounds is strong evidence the LINK died silently
+          // (mobile browsers kill sockets without delivering events). Do not
+          // wait out the 45-120s link-health detectors: bounce dead
+          // transports and re-announce NOW, then let the burst continue on
+          // the healed mesh (the reselection below picks the freshest peer).
+          console.warn("[p2p] sync motionless twice - reviving transports mid-burst");
+          this.revive();
+        }
         let best: PeerState | null = null;
         for (const p of this.peers.values()) {
           if (p.banned || !p.verified || !p.hello) continue;
@@ -1245,6 +1289,11 @@ export class P2pEngine {
 
   private async syncFromPeerInner(peerId: string): Promise<void> {
     let rollbackBudget = this.maxReorgDepth;
+    // A peer that already answered a batch this burst is PROVEN responsive -
+    // follow-up requests get half the silence budget (min 2.5s), so a link
+    // that dies mid-catch-up costs one short beat instead of a full 8s
+    // freeze per round. Unproven peers keep the full timeout.
+    let answeredOnce = false;
     bumpStat("syncsStarted");
     // The overlay bar's target: the tip the peer advertised at handshake
     // (or the highest block we've already seen from it). It can only grow
@@ -1257,8 +1306,14 @@ export class P2pEngine {
       const tip = await getTipSummary();
       setChainGateDetail(`block #${tip.height.toLocaleString("en-US")}`);
       if (target() > tip.height) setChainGateProgress(tip.height, target());
-      const batch = await this.requestBlocks(peerId, tip.height + 1, P2P_BLOCK_BATCH);
+      const batch = await this.requestBlocks(
+        peerId,
+        tip.height + 1,
+        P2P_BLOCK_BATCH,
+        answeredOnce ? Math.max(2_500, Math.floor(this.requestTimeoutMs / 2)) : undefined,
+      );
       if (batch.length === 0) return; // caught up (or peer went quiet)
+      answeredOnce = true;
       let restart = false;
       // Catch-up on a phone must never starve the compositor: the per-block
       // awaits are only microtask-level breathers, so every few blocks we

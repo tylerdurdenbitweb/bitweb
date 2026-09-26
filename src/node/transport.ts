@@ -89,7 +89,10 @@ export function randomPeerId(prefix: string): string {
 
 const PRESENCE_MS = 15_000; // re-announce cadence
 const PRESENCE_TTL_MS = 45_000; // silent peers are forgotten
-const CLAIM_DEADLINE_MS = 20_000; // max time to claim a lobby slot at boot
+// Max time to claim a lobby slot at boot. 20s per host was over-generous:
+// engine.start caps the TOTAL transport wait at 8s now, and a tighter
+// per-host deadline keeps the background reclaim ladder cycling faster.
+const CLAIM_DEADLINE_MS = 12_000;
 const REDIAL_MS = 60_000; // mesh-healing cadence for unclaimed lobby links
 /** Early redial ladder after boot: broker registrations propagate in seconds. */
 const REDIAL_BOOST_MS = [3_000, 5_000, 10_000, 20_000];

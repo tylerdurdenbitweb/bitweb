@@ -135,6 +135,31 @@ describe("wake watchdog (iOS Safari / all iOS browsers)", () => {
     expect(t.reviveCount).toBeLessThanOrEqual(5);
   });
 
+  it("a busy sync burst is not a freeze - the watchdog holds fire while syncing", async () => {
+    const t = new FakeTransport();
+    const e = engineWith(t, { tickMs: 25, freezeGapMs: 150, peerlessMs: 60_000, reviveMinMs: 0 });
+    await e.start();
+    await sleep(200); // healthy ticking baseline
+    expect(t.reviveCount).toBe(0);
+
+    // Main thread saturated applying blocks: wall clock jumps 10 s between
+    // ticks, but a sync burst is in flight - BUSY, not frozen. Pre-fix this
+    // tore down the very links feeding the sync, mid-burst.
+    (e as unknown as { syncing: boolean }).syncing = true;
+    clockOffset += 10_000;
+    await sleep(400); // several ticks observe the gap
+    expect(t.reviveCount).toBe(0);
+
+    // A TRULY dead event loop mid-sync (>=20 s) still revives.
+    clockOffset += 25_000;
+    await until(() => t.reviveCount >= 1, 3_000);
+
+    // Burst over: normal sensitivity returns on the next jump.
+    (e as unknown as { syncing: boolean }).syncing = false;
+    clockOffset += 10_000;
+    await until(() => t.reviveCount >= 2, 3_000);
+  });
+
   it("stop() disarms the watchdog: no revive from a post-stop clock jump", async () => {
     const t = new FakeTransport();
     const e = engineWith(t, { tickMs: 25, freezeGapMs: 150, peerlessMs: 150, reviveMinMs: 0 });

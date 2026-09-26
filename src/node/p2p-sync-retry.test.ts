@@ -48,6 +48,7 @@ class FakeTransport implements Transport {
   private events: TransportEvents | null = null;
   sent: Array<{ to: string; msg: Frame }> = [];
   closed: string[] = [];
+  reviveCount = 0;
 
   start(events: TransportEvents): Promise<void> {
     this.events = events;
@@ -63,6 +64,9 @@ class FakeTransport implements Transport {
   }
   links(): string[] {
     return [];
+  }
+  revive(): void {
+    this.reviveCount++;
   }
 
   // -- test drivers -----------------------------------------------------------
@@ -189,5 +193,61 @@ describe("catch-up sync resilience - quiet peers retried inside one gate", () =>
     expect(states.some((s) => s.active && s.detail?.startsWith("retrying"))).toBe(true);
     expect(gate.isChainUpdating()).toBe(false);
     expect((await chainB.getTipSummary()).hash).toBe(donorTip);
+  });
+
+  it("a peer silent on EVERY round: the burst revives transports mid-flight, then hands back to the heartbeat", async () => {
+    const w1 = walletFromPrivHex("01".repeat(32))!;
+
+    // donor: one block ahead is enough to make the peer worth syncing from
+    vi.resetModules();
+    const clientA = await import("./client");
+    const chainA = await import("./chain");
+    const { MemoryStorage: MemA } = await import("./storage");
+    const donor = await clientA.bootNode({ storage: new MemA(), transports: [] });
+    const tpl = await donor.template(w1.address);
+    const { nonce } = powSearch(
+      `BTWB1|${tpl.height}|${tpl.prevHash}|${tpl.merkleRoot}|${tpl.minTimestamp}|`,
+      tpl.target,
+    );
+    await donor.submitBlock(tpl.templateId, tpl.minTimestamp, nonce);
+    const donorTip = (await donor.info()).tipHash;
+    void chainA;
+    donor.stop();
+
+    vi.resetModules();
+    const gate = await import("./chain-gate");
+    const chainB = await import("./chain");
+    const { MemoryStorage: MemB } = await import("./storage");
+    await chainB.initChain(new MemB());
+    const { P2pEngine } = await import("./p2p");
+    const { solveSybilChallenge } = await import("./blockchain");
+
+    const fake = new FakeTransport();
+    const engine = new P2pEngine([fake], {
+      challengeTimeoutMs: 60_000,
+      syncRetryDelayMs: 10,
+      requestTimeoutMs: 200, // the silence window per round
+    });
+    cleanup.push(() => engine.stop());
+    await engine.start();
+
+    // verified peer, one block ahead - then TOTAL silence
+    fake.open("peer-a");
+    await until(() => fake.framesTo("peer-a", "hello").length > 0);
+    const ourHello = (fake.framesTo("peer-a", "hello").at(-1)!.msg as { hello: Record<string, unknown> }).hello;
+    fake.rx("peer-a", { type: "hello", hello: { ...ourHello, height: 1, tipHash: donorTip } });
+    await until(() => fake.framesTo("peer-a", "challenge").length > 0);
+    const ch = fake.framesTo("peer-a", "challenge").at(-1)!.msg as unknown as { nonce: string };
+    const solution = solveSybilChallenge(ch.nonce, SYBIL_CHALLENGE_PREFIX);
+    expect(solution).not.toBeNull();
+    fake.rx("peer-a", { type: "challengeResponse", nonce: ch.nonce, solution });
+
+    // three silent rounds inside ONE burst: round 2's motionlessness revives
+    // the transports NOW (not after the 45-120s link-health detectors), the
+    // third abort closes the gate back to the heartbeat.
+    await until(() => fake.framesTo("peer-a", "getBlocks").length >= 3, 10_000);
+    await until(() => !gate.isChainUpdating(), 10_000);
+    expect(fake.reviveCount).toBeGreaterThanOrEqual(1);
+    expect((await chainB.getTipSummary()).height).toBe(0); // nothing arrived
   });
 });

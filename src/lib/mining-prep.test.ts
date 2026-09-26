@@ -75,11 +75,31 @@ describe("prepareMiningStart", () => {
     expect(gate.isChainUpdating()).toBe(false);
   });
 
-  it("template failure reports 'template' and the gate still releases", async () => {
+  it("template failure reports 'template' with the REAL cause, and the gate still releases", async () => {
+    // The bare swallow sent users retrying the miner-cooldown wall forever:
+    // the refusal must carry the underlying message up to the UI.
     const { gate, prep } = await rig();
-    const r = await prep(() => Promise.reject(new Error("boom")));
-    expect(r).toEqual({ ok: false, reason: "template" });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const r = await prep(() =>
+      Promise.reject(new Error("miner cooldown: you mined the previous block - wait for another miner")),
+    );
+    expect(r).toEqual({
+      ok: false,
+      reason: "template",
+      detail: "miner cooldown: you mined the previous block - wait for another miner",
+    });
+    expect(warn).toHaveBeenCalled(); // the cause is never silent again
+    warn.mockRestore();
     expect(gate.isChainUpdating()).toBe(false);
     expect(gate.getChainGateState().depth).toBe(0);
+  });
+
+  it("a non-Error template failure is stringified into detail", async () => {
+    const { gate, prep } = await rig();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const r = await prep(() => Promise.reject("plain string failure"));
+    expect(r).toEqual({ ok: false, reason: "template", detail: "plain string failure" });
+    warn.mockRestore();
+    expect(gate.isChainUpdating()).toBe(false);
   });
 });

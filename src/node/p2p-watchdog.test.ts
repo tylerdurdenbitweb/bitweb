@@ -7,8 +7,10 @@
  *  - a frozen page is revived by its wall-clock jump alone,
  *  - healthy ticking never revives (no bounce storms on healthy desktops),
  *  - a node that HAD links and lost every one revives on its own,
- *  - a node that never saw a link is left to the normal reconnect ladders
- *    (it may simply be alone - reviving forever would hammer the brokers),
+ *  - a node that NEVER connected revives too (one bad boot window must not
+ *    be permanent - the "no peer connected forever" outage) but on a
+ *    bounded backoff, so a genuinely offline node cannot hammer brokers,
+ *  - a transport whose boot dial FAILED is re-dialed by the same revive,
  *  - revives are throttled while the outage persists,
  *  - stop() disarms the watchdog completely.
  * The freeze is simulated by jumping a mocked wall clock while the real
@@ -102,20 +104,66 @@ describe("wake watchdog (iOS Safari / all iOS browsers)", () => {
     expect(t.reviveCount).toBe(after);
   });
 
-  it("peerless with link memory revives on its own; a never-connected node stays on the ladders", async () => {
+  it("peerless with link memory revives on its own; a never-connected node revives on a backoff", async () => {
+    // Policy, changed deliberately: the old rule left never-connected nodes
+    // alone ("they may simply be solo"), which turned ONE bad boot window
+    // into a permanent zero-peer node in production. Now: had-links nodes
+    // revive on the flat cadence; never-connected nodes revive on
+    // reviveMinMs -> x2 -> x4 (cap), so a truly offline node pays at most
+    // one re-dial per 4x window instead of hammering the brokers.
+    const t = new FakeTransport();
+    const e = engineWith(t, { tickMs: 25, freezeGapMs: 60_000, peerlessMs: 200, reviveMinMs: 300 });
+    await e.start();
+
+    // never had links: first revive at ~peerlessMs, then gaps 300 -> 600
+    await until(() => t.reviveCount >= 1, 2_000);
+    const t1 = t.reviveCount;
+    await sleep(200); // inside the x2 (600 ms) gap: no second revive yet
+    expect(t.reviveCount).toBe(t1);
+    await until(() => t.reviveCount >= 2, 2_000); // the x2 window elapses
+    await sleep(200); // inside the x4 (1200 ms) gap: no third yet
+    expect(t.reviveCount).toBe(2);
+  });
+
+  it("had-links peerless revives stay on the flat cadence (no backoff)", async () => {
     const t = new FakeTransport();
     const e = engineWith(t, { tickMs: 25, freezeGapMs: 60_000, peerlessMs: 250, reviveMinMs: 0 });
     await e.start();
 
-    await sleep(500); // never had links: peerless must NOT fire
-    expect(t.reviveCount).toBe(0);
+    await sleep(300); // never had links: the backoff regime would fire here
+    const baseline = t.reviveCount;
 
     t.emitOpen("peer-1");
     await sleep(120); // ticks observe peerCount 1 -> hadLinks, fresh lastLinkAt
-    expect(t.reviveCount).toBe(0);
+    const afterLink = t.reviveCount;
 
     t.emitClose("peer-1"); // silent death: every link gone, no freeze
-    await until(() => t.reviveCount >= 1, 3_000);
+    await until(() => t.reviveCount > afterLink, 3_000);
+    expect(afterLink).toBe(baseline + 0); // the link itself caused no revive
+  });
+
+  it("a transport whose boot dial FAILED is re-dialed by the watchdog revive", async () => {
+    // The pre-fix hole: revive() only re-proved ACTIVE transports, so a
+    // boot-time dial failure (saturated thread, broker hiccup) was never
+    // retried - the node sat at zero peers until the next page load.
+    class FlakyTransport extends FakeTransport {
+      startCalls = 0;
+      async start(events: TransportEvents): Promise<void> {
+        this.startCalls += 1;
+        if (this.startCalls === 1) throw new Error("boot dial failed (transient)");
+        await super.start(events);
+      }
+    }
+    const t = new FlakyTransport();
+    const e = engineWith(t, { tickMs: 25, freezeGapMs: 60_000, peerlessMs: 150, reviveMinMs: 100 });
+    await e.start();
+    expect(t.startCalls).toBe(1); // the boot attempt failed...
+    expect(e.hasActiveTransports()).toBe(false);
+
+    await until(() => t.startCalls >= 2 && e.hasActiveTransports(), 3_000);
+    // ...and the revived transport carries links exactly like a boot one
+    t.emitOpen("peer-1");
+    await until(() => e.peerCount() === 1, 2_000);
   });
 
   it("watchdog revives are throttled while the outage persists", async () => {

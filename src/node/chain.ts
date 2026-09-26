@@ -75,6 +75,16 @@ import { setBootPhase, setBootProgress } from "./boot-progress";
 /** Consensus/state validation failure - the peer that caused it earns a strike. */
 export class ChainValidationError extends Error {}
 
+/**
+ * LOCAL template-construction refusal: this wallet mined the current tip,
+ * so consensus forbids it the very next block (rotation rule, active since
+ * height MINER_COOLDOWN_ACTIVATION_HEIGHT). Not a chain fault - nobody gets
+ * a strike - but it must be distinguishable from real template errors, so
+ * the miner can park quietly and wait for another miner's block instead of
+ * retrying a wall. The message text matches the consensus rule verbatim.
+ */
+export class MinerCooldownError extends ChainValidationError {}
+
 function bad(msg: string): never {
   throw new ChainValidationError(msg);
 }
@@ -658,7 +668,9 @@ export async function buildTemplate(minerAddress: string): Promise<TemplateView>
   const tip = await getTip();
   const height = tip.height + 1;
   if (violatesMinerCooldown(height, minerAddress, tip.miner)) {
-    bad("miner cooldown: you mined the previous block - wait for another miner");
+    throw new MinerCooldownError(
+      "miner cooldown: you mined the previous block - wait for another miner",
+    );
   }
   const target = await expectedTargetForHeight(height, tip);
   const mtp = await medianTimePast();

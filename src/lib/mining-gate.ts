@@ -63,7 +63,7 @@ export const MINING_PREP_SETTLE_MS = 750;
 
 export type MiningPrepResult =
   | { ok: true }
-  | { ok: false; reason: "updating" | "template" };
+  | { ok: false; reason: "updating" | "template"; detail?: string };
 
 /**
  * Pre-flight hold before the mining engine goes online. The user asked for
@@ -89,8 +89,16 @@ export async function prepareMiningStart(
     setChainGateDetail("building your mining template");
     try {
       await buildTemplate();
-    } catch {
-      return { ok: false, reason: "template" };
+    } catch (err) {
+      // NEVER swallow the cause bare: a silent "could not prepare" had the
+      // user retrying the miner-cooldown wall forever with no idea why. The
+      // reason rides up to the UI and into the console.
+      console.warn("[mining] template prep refused:", err);
+      return {
+        ok: false,
+        reason: "template",
+        detail: err instanceof Error ? err.message : String(err),
+      };
     }
     return { ok: true };
   } finally {

@@ -233,6 +233,12 @@ export class P2pEngine {
   private lastWatchdogTick = 0;
   private hadLinks = false;
   private lastLinkAt = 0;
+  /** Transports with a start attempt in flight (boot stragglers + retries). */
+  private startingTransports = new Set<Transport>();
+  /** Wired at start() so failed transports can be re-dialed long after boot. */
+  private transportEvents: TransportEvents | null = null;
+  /** Consecutive peerless revives while we NEVER had a link - drives the backoff. */
+  private peerlessRevives = 0;
   private lastWatchdogReviveAt = 0;
   private syncRetryDelayMs: number;
   private requestTimeoutMs: number;
@@ -291,27 +297,9 @@ export class P2pEngine {
     // way slower than mobile" gap. Stragglers keep initializing in the
     // background and join activeTransports the moment they are ready (their
     // event handlers are wired at start() entry), so the cap costs nothing.
-    const starts = this.transports.map((t) =>
-      Promise.resolve()
-        .then(() => t.start(events))
-        .then(() => {
-          if (this.stopped) {
-            // the engine stopped while this transport was still coming up -
-            // never leave a live transport behind a dead engine
-            try {
-              t.stop();
-            } catch {
-              /* best effort */
-            }
-            return;
-          }
-          this.activeTransports.push(t);
-          this.pushAnnouncedTip();
-        })
-        .catch((err) => {
-          console.warn(`[p2p] transport "${t.kind}" failed to start - continuing without it:`, err);
-        }),
-    );
+    this.transportEvents = events;
+    this.lastLinkAt = Date.now(); // the peerless grace window starts at boot
+    const starts = this.transports.map((t) => this.startTransport(t));
     await Promise.race([
       Promise.allSettled(starts),
       new Promise((r) => setTimeout(r, this.startCapMs)),
@@ -382,6 +370,8 @@ export class P2pEngine {
     if (this.watchdog) clearInterval(this.watchdog);
     this.watchdog = null;
     this.hadLinks = false;
+    this.peerlessRevives = 0;
+    this.transportEvents = null;
     this.attestations.clear();
     for (const t of this.activeTransports) t.stop();
     for (const [, p] of this.pendingBlocks) {
@@ -393,6 +383,45 @@ export class P2pEngine {
       if (p.challengeTimer) clearTimeout(p.challengeTimer);
     }
     this.peers.clear();
+  }
+
+  /**
+   * Starts one transport unless it is already active or mid-start, and
+   * tracks the attempt so the boot cap and the watchdog can await it.
+   * A transport whose boot dial failed is NOT in activeTransports - this
+   * method is also the watchdog's way of giving it another chance, which is
+   * what keeps one bad boot window from stranding the node peerless
+   * forever (the "no peer connected" reports).
+   */
+  private startTransport(t: Transport): Promise<void> {
+    if (this.activeTransports.includes(t) || this.startingTransports.has(t)) {
+      return Promise.resolve();
+    }
+    const events = this.transportEvents;
+    if (this.stopped || !events) return Promise.resolve();
+    this.startingTransports.add(t);
+    return Promise.resolve()
+      .then(() => t.start(events))
+      .then(() => {
+        if (this.stopped) {
+          // the engine stopped while this transport was still coming up -
+          // never leave a live transport behind a dead engine
+          try {
+            t.stop();
+          } catch {
+            /* best effort */
+          }
+          return;
+        }
+        this.activeTransports.push(t);
+        this.pushAnnouncedTip();
+      })
+      .catch((err) => {
+        console.warn(`[p2p] transport "${t.kind}" failed to start - continuing without it:`, err);
+      })
+      .finally(() => {
+        this.startingTransports.delete(t);
+      });
   }
 
   peerCount(): number {
@@ -432,6 +461,12 @@ export class P2pEngine {
         console.warn(`[p2p] transport "${t.kind}" revive failed:`, err);
       }
     }
+    // Re-dial whatever never came up (or died for good): activeTransports
+    // only holds successes, so without this a failed boot dial was never
+    // retried and the node sat at zero peers until the next page load.
+    for (const t of this.transports) {
+      if (!this.activeTransports.includes(t)) void this.startTransport(t);
+    }
     this.pushAnnouncedTip();
     if (!this.syncInFlight && this.syncQueued === null) void this.retrySyncIfBehind();
   }
@@ -463,21 +498,30 @@ export class P2pEngine {
     if (this.peerCount() > 0) {
       this.hadLinks = true;
       this.lastLinkAt = now;
+      this.peerlessRevives = 0;
       return;
     }
-    if (
-      this.hadLinks &&
-      this.hasActiveTransports() &&
-      now - this.lastLinkAt >= this.watchdogCfg.peerlessMs
-    ) {
+    // Peerless self-heal - two regimes:
+    //  - we HAD links and lost them all (iOS killed the sockets): revive on
+    //    a flat reviveMinMs cadence, the phone wants its mesh back fast.
+    //  - we NEVER connected (the boot dial hit a saturated thread or a
+    //    broker hiccup): revive too - a single bad boot window must never
+    //    be permanent - but on a bounded backoff (reviveMinMs, x2, x4 cap)
+    //    so a genuinely offline node cannot hammer the public brokers.
+    if (now - this.lastLinkAt >= this.watchdogCfg.peerlessMs) {
       this.reviveFromWatchdog("peerless");
     }
   }
 
   private reviveFromWatchdog(why: "freeze" | "peerless"): void {
     const now = Date.now();
-    if (now - this.lastWatchdogReviveAt < this.watchdogCfg.reviveMinMs) return;
+    const minGap =
+      why === "peerless" && !this.hadLinks
+        ? this.watchdogCfg.reviveMinMs * 2 ** Math.min(this.peerlessRevives, 2)
+        : this.watchdogCfg.reviveMinMs;
+    if (now - this.lastWatchdogReviveAt < minGap) return;
     this.lastWatchdogReviveAt = now;
+    if (why === "peerless" && !this.hadLinks) this.peerlessRevives += 1;
     console.info(`[p2p] watchdog revive (${why}) - re-proving all transports now`);
     this.revive();
   }

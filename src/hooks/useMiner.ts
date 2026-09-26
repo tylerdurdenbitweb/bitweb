@@ -4,6 +4,7 @@ import { useNode } from "@/providers/node-context";
 import type { MinerOutMsg } from "@/workers/miner.worker";
 import { MINING_HASHRATE_CAP } from "@contracts/protocol";
 import { isChainUpdating, subscribeChainGate } from "@/node/chain-gate";
+import { MinerCooldownError } from "@/node/chain";
 import { getMiningIntent, setMiningIntent } from "@/lib/mining-intent";
 import { setMiningWakeLock } from "@/lib/wake-lock";
 import { prepareMiningStart, wireMiningGate } from "@/lib/mining-gate";
@@ -136,6 +137,24 @@ export function useMiner(address: string | null) {
   // Set when the chain-update gate force-paused us: on gate release WE owe
   // the resume. A manual stop() clears it - user intent outranks automation.
   const gatePausedRef = useRef(false);
+  // Rotation wait: set when a start/park hit the miner cooldown (we hold
+  // the tip). Auto-resume stays armed but only re-attempts once the TIP
+  // actually changed - re-attempting on our own prep's gate-close was an
+  // endless ~1 Hz refusal loop on the live network.
+  const rotationTipRef = useRef<string | null>(null);
+  // Retry budget for NON-cooldown template failures (a storage stall can be
+  // transient): auto-resume waits this long before trying again.
+  const nextAutoRetryAtRef = useRef(0);
+  /** Remembers the tip identity so auto-resume retries only on rotation. */
+  const markRotationWait = useCallback(() => {
+    void node
+      .recentBlocks(1)
+      .then((rows) => {
+        const tip = rows[0];
+        if (tip) rotationTipRef.current = `${tip.height}:${tip.hash}`;
+      })
+      .catch(() => undefined);
+  }, [node]);
   const refreshTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const logIdRef = useRef(0);
   const addressRef = useRef(address);
@@ -175,6 +194,29 @@ export function useMiner(address: string | null) {
     ratesRef.current = [];
     setHashrate(0);
   }, []);
+
+  // Park when consensus itself refuses the next template: WE mined the
+  // current tip, so the rotation rule (active since height 2,000) forbids
+  // us the next block until ANOTHER miner wins one. Parking beats what the
+  // engine did before - a 30 s "template failed, retrying" storm on a stale
+  // template forever. The stored intent is NOT touched: the gate-close
+  // auto-resume brings mining back the moment a foreign block lands (the
+  // rotation marker below stops it from hammering our own prep's closes).
+  const parkForCooldown = useCallback(() => {
+    runningRef.current = false;
+    setRunning(false);
+    if (refreshTimerRef.current) clearInterval(refreshTimerRef.current);
+    refreshTimerRef.current = null;
+    killWorkers();
+    setTemplate(null);
+    setMiningWakeLock(false);
+    if (releaseLockRef.current) {
+      releaseLockRef.current(); // free the slot: another tab MAY rotate in
+      releaseLockRef.current = null;
+    }
+    markRotationWait();
+    pushLog("you mined the latest block - parked until another miner wins one (automatic)", "info");
+  }, [killWorkers, pushLog, markRotationWait]);
 
   const fetchTemplateAndSpin = useCallback(async () => {
     const addr = addressRef.current;
@@ -235,11 +277,15 @@ export function useMiner(address: string | null) {
         workersRef.current.push(w);
       }
     } catch (err) {
+      if (err instanceof MinerCooldownError) {
+        parkForCooldown(); // rotation wall - park, do NOT storm
+        return;
+      }
       pushLog(`template error: ${errMsg(err)}`, "err");
       notify("error", `Block template failed: ${errMsg(err)} - retrying automatically`);
     }
-     
-  }, [killWorkers, pushLog, node]);
+
+  }, [killWorkers, pushLog, node, parkForCooldown]);
 
   // Declared after fetchTemplateAndSpin - worker callbacks reach it through
   // handleFoundRef, so declaration order never matters at runtime.
@@ -280,6 +326,8 @@ export function useMiner(address: string | null) {
     (mode: "start" | "resume" = "start") => {
       runningRef.current = true;
       setRunning(true);
+      rotationTipRef.current = null; // mining runs - all wait states cleared
+      nextAutoRetryAtRef.current = 0;
       // An actively mining phone must not be screen-lock-killed: hold the
       // wake lock for the whole run (released by stop/pause/unmount).
       setMiningWakeLock(true);
@@ -345,8 +393,24 @@ export function useMiner(address: string | null) {
           pushLog("refused: chain is updating - mining starts when the update finishes", "err");
           if (!auto) notify("error", "Chain is updating - mining can start when the update finishes");
         } else {
-          pushLog("refused: could not prepare a mining template - try again", "err");
-          if (!auto) notify("error", "Mining prep failed - the template could not be built, try again");
+          // Surface the REAL cause (never a bare "try again"): the miner
+          // cooldown is the expected one above height 2,000 - it arms the
+          // rotation wait so auto-resume fires only when the tip changes.
+          const why = prep.detail ?? "unknown template error";
+          if (why.includes("cooldown")) {
+            markRotationWait();
+            pushLog(`refused: ${why} - mining resumes by itself after a foreign block`, "err");
+            if (!auto) {
+              notify(
+                "error",
+                "You mined the latest block - mining resumes automatically once another miner wins one",
+              );
+            }
+          } else {
+            nextAutoRetryAtRef.current = Date.now() + 5_000;
+            pushLog(`refused: ${why}`, "err");
+            if (!auto) notify("error", `Mining prep failed - ${why}`);
+          }
         }
         return;
       }
@@ -391,7 +455,7 @@ export function useMiner(address: string | null) {
       })
       .catch((err: unknown) => refuse(`mining lock error: ${errMsg(err)}`));
     })();
-  }, [beginMining, pushLog, node]);
+  }, [beginMining, pushLog, node, markRotationWait]);
 
   const stop = useCallback(() => {
     // Manual STOP is the only action that erases the stored intent: gate
@@ -399,6 +463,8 @@ export function useMiner(address: string | null) {
     setMiningIntent(false);
     setMiningWakeLock(false);
     gatePausedRef.current = false; // manual stop cancels any owed auto-resume
+    rotationTipRef.current = null;
+    nextAutoRetryAtRef.current = 0;
     preppingRef.current = false;
     pendingStartRef.current = false;
     runningRef.current = false;
@@ -469,7 +535,26 @@ export function useMiner(address: string | null) {
       if (disposed || !getMiningIntent()) return;
       if (runningRef.current || pendingStartRef.current || preppingRef.current) return;
       if (isChainUpdating()) return;
-      start({ auto: true });
+      if (Date.now() < nextAutoRetryAtRef.current) return; // transient-error backoff
+      // Rotation wait: after a cooldown refusal, re-attempt ONLY when the
+      // tip actually changed. Our own prep opens and closes the gate, so
+      // keying retries to bare gate-closes was an endless refusal loop on
+      // the live network (the repeated "could not prepare" log lines).
+      const rotationTip = rotationTipRef.current;
+      void (async () => {
+        if (rotationTip !== null) {
+          const rows = await node.recentBlocks(1).catch(() => null);
+          if (disposed || !rows) return;
+          const tip = rows[0];
+          if (!tip || rotationTipRef.current !== rotationTip) return; // state moved on
+          if (`${tip.height}:${tip.hash}` === rotationTip) return; // same tip: still our wall
+          rotationTipRef.current = null; // rotation happened - mining may proceed
+        }
+        if (disposed) return;
+        if (runningRef.current || pendingStartRef.current || preppingRef.current) return;
+        if (isChainUpdating()) return;
+        start({ auto: true });
+      })();
     };
     tryAutoStart();
     const unsub = subscribeChainGate((st) => {
@@ -479,7 +564,7 @@ export function useMiner(address: string | null) {
       disposed = true;
       unsub();
     };
-  }, [address, start]);
+  }, [address, start, node]);
 
   // restart on thread-count change while running
   useEffect(() => {

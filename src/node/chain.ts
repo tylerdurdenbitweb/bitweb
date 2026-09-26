@@ -1942,8 +1942,18 @@ export function sanitizeChainExport(data: unknown): ChainExport {
  * is replayed in memory (balances + nonces, credited at end of block exactly
  * like applyBlockInTx) so a file that overspends never reaches storage.
  * Throws on the FIRST failure: an import is all-or-nothing, never partial.
+ *
+ * Cooperative slicing: a full replay is PURE CPU (PoW rehash per block, every
+ * secp256k1 signature, the whole ledger) - on a grown chain that is minutes
+ * of unbroken main-thread work, which is exactly what made Safari declare
+ * the page unresponsive and beach-ball the whole browser. The loop below
+ * hands the event loop a macrotask every ~VALIDATE_SLICE_MS so paint, input
+ * and IDB callbacks stay alive. Validation ORDER and semantics are
+ * bit-identical to the synchronous version - only scheduling changes.
  */
-function validateExportBlocks(blocks: WireBlock[]): void {
+const VALIDATE_SLICE_MS = 12;
+
+async function validateExportBlocks(blocks: WireBlock[]): Promise<void> {
   const g = genesisParts();
   const first = blocks[0];
   if (
@@ -1977,7 +1987,17 @@ function validateExportBlocks(blocks: WireBlock[]): void {
     return e;
   };
 
+  let sliceStartedAt = Date.now();
+  const validateTotal = blocks.length - 1;
   for (let i = 1; i < blocks.length; i++) {
+    if (Date.now() - sliceStartedAt >= VALIDATE_SLICE_MS) {
+      // Progress rides the same gate channel as the apply phase, so a long
+      // validation shows live numbers instead of looking frozen.
+      setChainGateDetail(`validating block ${i}/${validateTotal}`);
+      setChainGateProgress(i, validateTotal);
+      await new Promise((r) => setTimeout(r, 0));
+      sliceStartedAt = Date.now();
+    }
     const wb = blocks[i];
     const prev = blocks[i - 1];
     if (wb.height !== i) bad(`height gap in export at block ${wb.height}`);
@@ -2257,7 +2277,7 @@ export async function importChain(data: unknown, opts?: ImportOptions): Promise<
       bad("chain id mismatch - this export is from another network");
     }
     // all-or-nothing: prove the file in full before touching storage
-    validateExportBlocks(file.blocks);
+    await validateExportBlocks(file.blocks);
     const fileTip = file.blocks[file.blocks.length - 1];
 
     return await withLock(async () => {
@@ -2327,7 +2347,7 @@ export async function importChain(data: unknown, opts?: ImportOptions): Promise<
 export function adoptRemoteChain(blocks: WireBlock[]): Promise<number> {
   if (blocks.length === 0) throw new ChainValidationError("empty remote chain");
   return withLock(async () => {
-    validateExportBlocks(blocks);
+    await validateExportBlocks(blocks);
     const tip = await getTip();
     if (tip.height > 0) await resetChainToGenesisLocked();
     try {

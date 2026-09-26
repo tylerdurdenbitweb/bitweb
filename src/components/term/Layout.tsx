@@ -85,7 +85,12 @@ function BootOverlay({ onDone }: { onDone: () => void }) {
 // APPEARS after 250ms (a single gossiped block lands in milliseconds and
 // must not flash a modal), and it lingers 150ms before closing so
 // back-to-back operations read as one calm update, not a strobe.
-const CHAIN_OVERLAY_SHOW_MS = 250;
+// Show threshold: a single gossiped block applies in a few hundred ms on a
+// phone, so a 250ms threshold flashed the full-screen UPDATING overlay on
+// EVERY block - and each flash force-pauses mining. 1200ms keeps the
+// overlay for genuinely long work (sync bursts, imports, heals) while
+// routine one-block updates pass silently through the header indicator.
+const CHAIN_OVERLAY_SHOW_MS = 1_200;
 const CHAIN_OVERLAY_HIDE_MS = 150;
 
 function ChainUpdateOverlay() {

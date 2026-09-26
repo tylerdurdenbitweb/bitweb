@@ -290,3 +290,46 @@ describe("no secrets, no script - the file is inert public data", () => {
     }
   }, 240_000);
 });
+
+describe("cooperative validation slicing", () => {
+  it("a full-file validation yields macrotask slots and reports live progress", async () => {
+    // The validator is pure CPU over the WHOLE chain; run synchronously it
+    // pinned the main thread for minutes and Safari killed the page. Force
+    // the time-slice to expire on the very first block (2nd Date.now call)
+    // and prove: the import still validates + applies bit-for-bit, and the
+    // gate carried a live "validating block i/N" detail during the proof.
+    const src = await freshChain();
+    await mineOne(src, w1.address).then(() => mineOne(src, w1.address));
+    const data = asFile(await src.exportChain());
+
+    const dst = await freshChain();
+    const gate = await import("./chain-gate");
+    const details: Array<string | null> = [];
+    gate.subscribeChainGate((st) => details.push(st.detail));
+
+    const realNow = Date.now;
+    let call = 0;
+    const spy = vi.spyOn(Date, "now").mockImplementation(() => {
+      // Every call jumps the clock +1s: the slice-start read and the loop
+      // check land 1s apart no matter how many unrelated Date.now calls the
+      // import path makes first, so the slice fires on EVERY block. 1s per
+      // call stays far below the 6s IDB stall budget (a guard sees ~2 calls
+      // per request) and adds only seconds of simulated drift - timestamps
+      // are unaffected (the baked chain is days in the past). A retune of
+      // VALIDATE_SLICE_MS beyond 1s breaks this test loudly instead of
+      // silently disabling the coverage.
+      call += 1;
+      return realNow() + call * 1_000;
+    });
+    try {
+      const res = await dst.importChain(data);
+      expect(res.applied).toBe(true);
+      expect(res.height).toBe(2);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(details.some((d) => d === "validating block 1/2")).toBe(true);
+    const tip = await dst.getTipSummary();
+    expect(tip.height).toBe(2);
+  }, 240_000);
+});

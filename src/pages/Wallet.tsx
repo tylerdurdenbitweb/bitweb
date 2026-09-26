@@ -318,7 +318,7 @@ export default function Wallet() {
                   [x] STOP MINING
                 </button>
               ) : (
-                <button className="term-btn term-btn-primary px-6 py-2" onClick={miner.start}>
+                <button className="term-btn term-btn-primary px-6 py-2" onClick={() => miner.start()}>
                   [&gt;] START MINING
                 </button>
               )}

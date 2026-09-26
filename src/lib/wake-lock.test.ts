@@ -11,6 +11,7 @@ import {
   __resetWakeLockForTests,
   chainWakeLockHeld,
   setChainWakeLock,
+  setMiningWakeLock,
 } from "./wake-lock";
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
@@ -160,5 +161,72 @@ describe("chain wake lock", () => {
     await tick();
     expect(chainWakeLockHeld()).toBe(false);
     expect(late.releasedByUs).toBe(true); // immediately released, never held
+  });
+});
+
+describe("multi-hold: chain + mining share one lock", () => {
+  it("the mining hold alone keeps the screen awake", async () => {
+    const env = stubEnv();
+    setMiningWakeLock(true);
+    await tick();
+    expect(chainWakeLockHeld()).toBe(true);
+    expect(env.granted.length).toBe(1);
+    setMiningWakeLock(false);
+    await tick();
+    expect(chainWakeLockHeld()).toBe(false);
+    expect(env.granted[0].releasedByUs).toBe(true);
+  });
+
+  it("the lock survives one hold dropping while the other stays up", async () => {
+    const env = stubEnv();
+    setChainWakeLock(true); // gate opened (sync) while mining
+    setMiningWakeLock(true); // mining was already holding
+    await tick();
+    expect(env.granted.length).toBe(1); // one lock, two holds
+    setChainWakeLock(false); // gate closes - mining still runs
+    await tick();
+    expect(chainWakeLockHeld()).toBe(true); // NOT released under the miner
+    expect(env.granted[0].releasedByUs).toBe(false);
+    setMiningWakeLock(false); // last hold drops
+    await tick();
+    expect(chainWakeLockHeld()).toBe(false);
+    expect(env.granted[0].releasedByUs).toBe(true);
+  });
+
+  it("re-acquires on visibility restore while only the mining hold is up", async () => {
+    const env = stubEnv();
+    setMiningWakeLock(true);
+    await tick();
+    expect(env.granted.length).toBe(1);
+    env.granted[0].fireOsRelease(); // Safari took it back on tab hide
+    env.doc.visibilityState = "visible";
+    env.doc.fire("visibilitychange");
+    await tick();
+    expect(env.granted.length).toBe(2);
+    expect(chainWakeLockHeld()).toBe(true);
+  });
+
+  it("a hold dropping mid-request drops the late sentinel (mining variant)", async () => {
+    (globalThis as { document?: unknown }).document = {
+      visibilityState: "visible",
+      addEventListener: () => undefined,
+    };
+    let resolveRequest: ((s: FakeSentinel) => void) | null = null;
+    (globalThis as { navigator?: unknown }).navigator = {
+      wakeLock: {
+        request: () =>
+          new Promise<FakeSentinel>((r) => {
+            resolveRequest = r;
+          }),
+      },
+    };
+    setMiningWakeLock(true);
+    await tick();
+    setMiningWakeLock(false); // stop() landed while the request was in flight
+    const late = new FakeSentinel();
+    resolveRequest!(late);
+    await tick();
+    expect(chainWakeLockHeld()).toBe(false);
+    expect(late.releasedByUs).toBe(true);
   });
 });

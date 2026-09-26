@@ -3,7 +3,9 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useNode } from "@/providers/node-context";
 import type { MinerOutMsg } from "@/workers/miner.worker";
 import { MINING_HASHRATE_CAP } from "@contracts/protocol";
-import { isChainUpdating } from "@/node/chain-gate";
+import { isChainUpdating, subscribeChainGate } from "@/node/chain-gate";
+import { getMiningIntent, setMiningIntent } from "@/lib/mining-intent";
+import { setMiningWakeLock } from "@/lib/wake-lock";
 import { prepareMiningStart, wireMiningGate } from "@/lib/mining-gate";
 import { notify } from "@/lib/notify";
 import { shortAddr } from "@/lib/format";
@@ -278,6 +280,9 @@ export function useMiner(address: string | null) {
     (mode: "start" | "resume" = "start") => {
       runningRef.current = true;
       setRunning(true);
+      // An actively mining phone must not be screen-lock-killed: hold the
+      // wake lock for the whole run (released by stop/pause/unmount).
+      setMiningWakeLock(true);
       if (mode === "resume") {
         pushLog("chain ready - mining resumed on the fresh tip");
         notify("mining_start", "Chain updated - mining resumed on the fresh tip");
@@ -294,7 +299,15 @@ export function useMiner(address: string | null) {
     [fetchTemplateAndSpin, pushLog],
   );
 
-  const start = useCallback(() => {
+  const start = useCallback((opts?: { auto?: boolean }) => {
+    // auto = boot / gate-close auto-resume: the stored intent drives it, it
+    // never writes the intent itself, and it stays out of the notification
+    // tray (the log alone records what happened). Manual START is the only
+    // path that records the intent - and it records it even when this very
+    // attempt is refused by a running update, so the auto-resume below can
+    // pick mining up the moment the gate closes: no second press needed.
+    const auto = opts?.auto === true;
+    if (!auto) setMiningIntent(true);
     // The pending guard closes the double-click race: lock acquisition is
     // async, so without it two quick clicks would fire two acquisitions.
     if (runningRef.current || pendingStartRef.current || preppingRef.current || !addressRef.current) return;
@@ -302,14 +315,14 @@ export function useMiner(address: string | null) {
     // ANY path - mining cannot start until the state is fully applied.
     if (isChainUpdating()) {
       pushLog("refused: chain is updating - mining starts when the update finishes", "err");
-      notify("error", "Chain is updating - mining can start when the update finishes");
+      if (!auto) notify("error", "Chain is updating - mining can start when the update finishes");
       return;
     }
     preppingRef.current = true;
     const refuse = (text: string) => {
       pendingStartRef.current = false;
       pushLog(text, "err");
-      notify("error", text);
+      if (!auto) notify("error", text);
     };
     const grant = (release: () => void) => {
       if (!pendingStartRef.current) {
@@ -330,10 +343,10 @@ export function useMiner(address: string | null) {
       if (!prep.ok) {
         if (prep.reason === "updating") {
           pushLog("refused: chain is updating - mining starts when the update finishes", "err");
-          notify("error", "Chain is updating - mining can start when the update finishes");
+          if (!auto) notify("error", "Chain is updating - mining can start when the update finishes");
         } else {
           pushLog("refused: could not prepare a mining template - try again", "err");
-          notify("error", "Mining prep failed - the template could not be built, try again");
+          if (!auto) notify("error", "Mining prep failed - the template could not be built, try again");
         }
         return;
       }
@@ -381,6 +394,10 @@ export function useMiner(address: string | null) {
   }, [beginMining, pushLog, node]);
 
   const stop = useCallback(() => {
+    // Manual STOP is the only action that erases the stored intent: gate
+    // pauses, reloads and unmounts must never clear it - only the user can.
+    setMiningIntent(false);
+    setMiningWakeLock(false);
     gatePausedRef.current = false; // manual stop cancels any owed auto-resume
     preppingRef.current = false;
     pendingStartRef.current = false;
@@ -408,6 +425,9 @@ export function useMiner(address: string | null) {
     pendingStartRef.current = false; // cancels an in-flight lock acquisition
     runningRef.current = false;
     setRunning(false);
+    // The mining hold drops while paused; the gate's own wake-lock hold
+    // keeps the screen alive through the update.
+    setMiningWakeLock(false);
     if (refreshTimerRef.current) clearInterval(refreshTimerRef.current);
     refreshTimerRef.current = null;
     killWorkers();
@@ -435,6 +455,32 @@ export function useMiner(address: string | null) {
     });
   }, [pauseForGate, resumeAfterGate]);
 
+  // -- persistent intent: auto-resume ----------------------------------------
+  // A manual START survives reloads, tab restores and app updates (the
+  // intent lives in localStorage; every in-memory ref does not). Whenever
+  // this page is up with the intent set, mining off and the gate idle, start
+  // without waiting for another button press - and retry on every gate
+  // close, which also covers a start refused by the boot sync. Manual STOP
+  // erased the intent, so this never resurrects mining the user ended.
+  useEffect(() => {
+    if (!address) return;
+    let disposed = false;
+    const tryAutoStart = () => {
+      if (disposed || !getMiningIntent()) return;
+      if (runningRef.current || pendingStartRef.current || preppingRef.current) return;
+      if (isChainUpdating()) return;
+      start({ auto: true });
+    };
+    tryAutoStart();
+    const unsub = subscribeChainGate((st) => {
+      if (!st.active) tryAutoStart();
+    });
+    return () => {
+      disposed = true;
+      unsub();
+    };
+  }, [address, start]);
+
   // restart on thread-count change while running
   useEffect(() => {
     if (runningRef.current) void fetchTemplateAndSpin();
@@ -445,6 +491,7 @@ export function useMiner(address: string | null) {
   useEffect(() => {
     return () => {
       runningRef.current = false;
+      setMiningWakeLock(false);
       if (refreshTimerRef.current) clearInterval(refreshTimerRef.current);
       for (const w of workersRef.current) w.terminate();
       workersRef.current = [];
